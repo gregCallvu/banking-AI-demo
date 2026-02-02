@@ -84,24 +84,61 @@ const allowedIntents = new Set([
 const getFallbackReply = () =>
   'Sorry, I’m unable to process that right now. I can help you make a loan payment, apply for a credit card, or dispute a charge. Please tell me which of these you would like to do next.'
 
+const buildChatResponse = ({
+  reply,
+  intent,
+  buttons = null,
+  actionUrl = null,
+  buttonText = null,
+  entities = null,
+}) => {
+  const handler = intentHandlers[intent] || intentHandlers.GENERAL_BANKING_QUESTION
+  const { action, actionHint, launchTarget } = handler({ message: reply })
+  return {
+    reply,
+    assistantMessage: reply,
+    intent,
+    entities,
+    requestedTool: null,
+    toolArguments: null,
+    toolResult: null,
+    toolError: null,
+    action,
+    actionHint,
+    launchTarget,
+    mcpConfigured: hasCallvuConfig,
+    suggestedNextSteps: getSuggestedNextSteps(intent),
+    message: reply,
+    actionUrl,
+    buttonText,
+    button: actionUrl
+      ? {
+          label: buttonText ?? 'Open Form',
+          url: actionUrl,
+          openInNewWindow: true,
+        }
+      : null,
+    buttons,
+  }
+}
 const safeReplyForIntent = (intent) => {
   switch (intent) {
     case 'CHECK_LOAN_PAYMENT':
-      return 'I can help you make a loan payment now. Click below to continue.'
+      return 'No problem — I’ll take you to our secure loan payment center.'
     case 'LOAN_PAYMENT':
-      return 'Click below to make your loan payment securely.'
+      return 'No problem — I’ll take you to our secure loan payment center.'
     case 'AUTO_LOAN_PAYMENT':
-      return 'Click below to make your auto loan payment securely.'
+      return 'No problem — I’ll take you to our secure auto loan payment center.'
     case 'CREDIT_CARD_PAYMENT':
-      return 'Click below to make your credit card payment securely.'
+      return 'No problem — I’ll take you to our secure credit card payment center.'
     case 'MORTGAGE_PAYMENT':
-      return 'Click below to make your mortgage payment securely.'
+      return 'No problem — I’ll take you to our secure mortgage payment center.'
     case 'APPLY_CREDIT_CARD':
-      return 'I can help you apply for a credit card. Please use the Secure Application to continue.'
+      return 'Great choice — let’s get your application started.'
     case 'APPLY_LOAN':
-      return 'I can help you apply for a loan. Please use the Secure Application to continue.'
+      return 'Perfect — I’ll take you to our secure loan application.'
     case 'DISPUTE_CHARGE':
-      return 'I can help you dispute a charge. Please use the Dispute Resolution form to continue.'
+      return 'Thanks — let’s get that dispute started.'
     default:
       return getFallbackReply()
   }
@@ -149,57 +186,48 @@ const validateToolArguments = (toolDefinition, args) => {
 }
 
 const creditCardFlowBySession = new Map()
-
-const fallbackCreditCardQuestions = [
-  'Is this for a personal or business card?',
-  'Are you interested in rewards, airline miles, or a student card?',
-  'Do you want a card with no annual fee or premium perks?',
-]
+const paymentFlowBySession = new Map()
+const loanApplicationFlowBySession = new Map()
+const disputeFlowBySession = new Map()
 
 const isCreditCardApplyRequest = (text) => {
   const msg = text.toLowerCase()
+  if (msg.includes('debit')) return false
+  const hasCreditCard = msg.includes('credit card') || msg.includes('card')
+  const applySignals =
+    msg.includes('apply') ||
+    msg.includes('application') ||
+    msg.includes('sign up') ||
+    msg.includes('signup') ||
+    msg.includes('get a') ||
+    msg.includes('open a') ||
+    msg.includes('new card')
+  return hasCreditCard && applySignals
+}
+
+const isLoanApplyRequest = (text) => {
+  const msg = text.toLowerCase()
+  return msg.includes('apply') && msg.includes('loan')
+}
+
+const isDisputeRequest = (text) => {
+  const msg = text.toLowerCase()
   return (
-    (msg.includes('apply') && msg.includes('credit card')) ||
-    msg.includes('credit card application') ||
-    msg.includes('apply for a card')
+    msg.includes('dispute') ||
+    msg.includes('chargeback') ||
+    msg.includes('contest') ||
+    msg.includes('disputing')
   )
 }
 
-const buildCreditCardQuestions = async () => {
-  try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.4,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: `Generate 2 to 3 concise questions to help select a credit card.
-Return JSON: {"questions": ["q1","q2","q3"]}.
-Avoid emojis. Keep questions short and clear.`.trim(),
-        },
-      ],
-    })
-
-    const content = response.choices?.[0]?.message?.content?.trim() || '{}'
-    const parsed = JSON.parse(content)
-    const questions = Array.isArray(parsed.questions) ? parsed.questions : []
-    const trimmed = questions
-      .map((q) => (typeof q === 'string' ? q.trim() : ''))
-      .filter((q) => q.length > 0)
-      .slice(0, 3)
-
-    if (trimmed.length >= 2) {
-      return trimmed
-    }
-  } catch (error) {
-    // fall through to default questions
-  }
-
-  return fallbackCreditCardQuestions
+const getPaymentSubtypeIntent = (text) => {
+  const msg = text.toLowerCase()
+  if (msg.includes('mortgage')) return 'MORTGAGE_PAYMENT'
+  if (msg.includes('credit card')) return 'CREDIT_CARD_PAYMENT'
+  if (msg.includes('auto loan')) return 'AUTO_LOAN_PAYMENT'
+  if (msg.includes('loan')) return 'CHECK_LOAN_PAYMENT'
+  return null
 }
-
-const pendingPaymentBySession = new Map()
 
 const getSessionKey = (req) => req.body?.sessionId || req.ip || 'anonymous'
 
@@ -216,15 +244,70 @@ const isGenericPaymentRequest = (text) => {
 }
 
 const buildPaymentChoiceResponse = () => ({
-  reply: 'Which account would you like to make a payment for?',
+  reply: 'Sure — what type of account would you like to make a payment on?',
   intent: 'GENERAL_BANKING_QUESTION',
   buttons: [
     { label: 'Mortgage', actionIntent: 'MORTGAGE_PAYMENT' },
-    { label: 'Loan', actionIntent: 'LOAN_PAYMENT' },
-    { label: 'Auto Loan', actionIntent: 'AUTO_LOAN_PAYMENT' },
     { label: 'Credit Card', actionIntent: 'CREDIT_CARD_PAYMENT' },
+    { label: 'Auto Loan', actionIntent: 'AUTO_LOAN_PAYMENT' },
+    { label: 'Personal Loan', actionIntent: 'LOAN_PAYMENT' },
   ],
 })
+
+const buildCreditCardTypeResponse = () => ({
+  reply: 'What type of card are you looking for?',
+  intent: 'APPLY_CREDIT_CARD',
+  buttons: [
+    { label: 'Personal', actionIntent: 'CREDIT_CARD_TYPE_PERSONAL' },
+    { label: 'Business', actionIntent: 'CREDIT_CARD_TYPE_BUSINESS' },
+  ],
+})
+
+const buildCreditCardFeatureResponse = () => ({
+  reply: 'Which card features matter most to you?',
+  intent: 'APPLY_CREDIT_CARD',
+  buttons: [
+    { label: 'Cash Back', actionIntent: 'CREDIT_CARD_FEATURE_CASH_BACK' },
+    { label: 'Airline Miles', actionIntent: 'CREDIT_CARD_FEATURE_AIRLINE_MILES' },
+    { label: 'Low APR', actionIntent: 'CREDIT_CARD_FEATURE_LOW_APR' },
+  ],
+})
+
+const buildLoanApplicationTypeResponse = () => ({
+  reply: 'What type of loan are you interested in?',
+  intent: 'APPLY_LOAN',
+  buttons: [
+    { label: 'Personal Loan', actionIntent: 'LOAN_TYPE_PERSONAL' },
+    { label: 'Home Equity', actionIntent: 'LOAN_TYPE_HOME_EQUITY' },
+    { label: 'Auto Loan', actionIntent: 'LOAN_TYPE_AUTO' },
+  ],
+})
+
+const buildDisputeQualificationResponse = () => ({
+  reply:
+    'Is this a dispute because the card was lost/stolen, or is the charge amount incorrect?',
+  intent: 'DISPUTE_CHARGE',
+  buttons: [
+    { label: 'Lost/Stolen', actionIntent: 'DISPUTE_LOST_STOLEN' },
+    { label: 'Wrong Amount', actionIntent: 'DISPUTE_WRONG_AMOUNT' },
+  ],
+})
+
+const paymentActionIntents = [
+  'MORTGAGE_PAYMENT',
+  'CREDIT_CARD_PAYMENT',
+  'AUTO_LOAN_PAYMENT',
+  'LOAN_PAYMENT',
+]
+
+const creditCardTypeIntents = ['CREDIT_CARD_TYPE_PERSONAL', 'CREDIT_CARD_TYPE_BUSINESS']
+const creditCardFeatureIntents = [
+  'CREDIT_CARD_FEATURE_CASH_BACK',
+  'CREDIT_CARD_FEATURE_AIRLINE_MILES',
+  'CREDIT_CARD_FEATURE_LOW_APR',
+]
+const loanTypeIntents = ['LOAN_TYPE_PERSONAL', 'LOAN_TYPE_HOME_EQUITY', 'LOAN_TYPE_AUTO']
+const disputeAnswerIntents = ['DISPUTE_LOST_STOLEN', 'DISPUTE_WRONG_AMOUNT']
 
 const intentHandlers = {
   CHECK_LOAN_PAYMENT: ({ user }) => ({
@@ -381,212 +464,259 @@ app.post('/api/chat', async (req, res) => {
   try {
     const sessionKey = getSessionKey(req)
 
-    const activeCreditFlow = creditCardFlowBySession.get(sessionKey)
-    if (activeCreditFlow) {
-      activeCreditFlow.answers.push(message)
-      if (activeCreditFlow.step < activeCreditFlow.questions.length) {
-        const nextQuestion = activeCreditFlow.questions[activeCreditFlow.step]
-        activeCreditFlow.step += 1
-        creditCardFlowBySession.set(sessionKey, activeCreditFlow)
-        return res.json({
-          reply: nextQuestion,
-          assistantMessage: nextQuestion,
-          intent: 'APPLY_CREDIT_CARD',
-          entities: { answers: activeCreditFlow.answers },
-          requestedTool: null,
-          toolArguments: null,
-          toolResult: null,
-          toolError: null,
-          action: intentHandlers.APPLY_CREDIT_CARD().action,
-          actionHint: intentHandlers.APPLY_CREDIT_CARD().actionHint,
-          launchTarget: intentHandlers.APPLY_CREDIT_CARD().launchTarget,
-          mcpConfigured: hasCallvuConfig,
-          suggestedNextSteps: getSuggestedNextSteps('APPLY_CREDIT_CARD'),
-          message: nextQuestion,
-          actionUrl: null,
-          buttonText: null,
-          button: null,
-        })
-      }
+    const isPaymentAction = paymentActionIntents.includes(actionIntent)
+    const isCreditCardAction =
+      creditCardTypeIntents.includes(actionIntent) || creditCardFeatureIntents.includes(actionIntent)
+    const isLoanAction = loanTypeIntents.includes(actionIntent)
+    const isDisputeAction = disputeAnswerIntents.includes(actionIntent)
 
+    // Reset flows if user changes intent mid-flow.
+    if (isCreditCardApplyRequest(message) || isCreditCardAction) {
+      loanApplicationFlowBySession.delete(sessionKey)
+      disputeFlowBySession.delete(sessionKey)
+      paymentFlowBySession.delete(sessionKey)
+    } else if (isLoanApplyRequest(message) || isLoanAction) {
       creditCardFlowBySession.delete(sessionKey)
-      const resolvedIntent = 'APPLY_CREDIT_CARD'
-      const actionUrl = intentToActionUrl[resolvedIntent]
-      const reply =
-        'Based on your preferences, you can apply for your selected credit card securely using the link below.'
-      return res.json({
-        reply,
-        assistantMessage: reply,
-        intent: resolvedIntent,
-        entities: { answers: activeCreditFlow.answers },
-        requestedTool: null,
-        toolArguments: null,
-        toolResult: null,
-        toolError: null,
-        action: intentHandlers.APPLY_CREDIT_CARD().action,
-        actionHint: intentHandlers.APPLY_CREDIT_CARD().actionHint,
-        launchTarget: intentHandlers.APPLY_CREDIT_CARD().launchTarget,
-        mcpConfigured: hasCallvuConfig,
-        suggestedNextSteps: getSuggestedNextSteps(resolvedIntent),
-        message: reply,
-        actionUrl,
-        buttonText: 'Secure Application',
-        button: actionUrl
-          ? {
-              label: 'Secure Application',
-              url: actionUrl,
-              openInNewWindow: true,
-            }
-          : null,
-      })
+      disputeFlowBySession.delete(sessionKey)
+      paymentFlowBySession.delete(sessionKey)
+    } else if (isDisputeRequest(message) || isDisputeAction) {
+      creditCardFlowBySession.delete(sessionKey)
+      loanApplicationFlowBySession.delete(sessionKey)
+      paymentFlowBySession.delete(sessionKey)
+    } else if (isGenericPaymentRequest(message) || getPaymentSubtypeIntent(message) || isPaymentAction) {
+      creditCardFlowBySession.delete(sessionKey)
+      loanApplicationFlowBySession.delete(sessionKey)
+      disputeFlowBySession.delete(sessionKey)
     }
 
-    if (isCreditCardApplyRequest(message)) {
-      const questions = await buildCreditCardQuestions()
-      creditCardFlowBySession.set(sessionKey, {
-        step: 1,
-        answers: [],
-        questions,
-      })
-      const firstQuestion = questions[0]
-      return res.json({
-        reply: firstQuestion,
-        assistantMessage: firstQuestion,
-        intent: 'APPLY_CREDIT_CARD',
-        entities: null,
-        requestedTool: null,
-        toolArguments: null,
-        toolResult: null,
-        toolError: null,
-        action: intentHandlers.APPLY_CREDIT_CARD().action,
-        actionHint: intentHandlers.APPLY_CREDIT_CARD().actionHint,
-        launchTarget: intentHandlers.APPLY_CREDIT_CARD().launchTarget,
-        mcpConfigured: hasCallvuConfig,
-        suggestedNextSteps: getSuggestedNextSteps('APPLY_CREDIT_CARD'),
-        message: firstQuestion,
-        actionUrl: null,
-        buttonText: null,
-        button: null,
-      })
-    }
-
-    if (
-      actionIntent &&
-      ['LOAN_PAYMENT', 'AUTO_LOAN_PAYMENT', 'CREDIT_CARD_PAYMENT', 'MORTGAGE_PAYMENT'].includes(
-        actionIntent
-      )
-    ) {
-      if (!pendingPaymentBySession.has(sessionKey)) {
-        const choiceResponse = buildPaymentChoiceResponse()
-        return res.json({
-          ...choiceResponse,
-          assistantMessage: choiceResponse.reply,
-          message: choiceResponse.reply,
-          button: null,
-          actionUrl: null,
-          buttonText: null,
-          requestedTool: null,
-          toolArguments: null,
-          toolResult: null,
-          toolError: null,
-          action: intentHandlers.GENERAL_BANKING_QUESTION().action,
-          actionHint: intentHandlers.GENERAL_BANKING_QUESTION().actionHint,
-          launchTarget: intentHandlers.GENERAL_BANKING_QUESTION().launchTarget,
-          mcpConfigured: hasCallvuConfig,
-          suggestedNextSteps: getSuggestedNextSteps('GENERAL_BANKING_QUESTION'),
-        })
-      }
-      pendingPaymentBySession.delete(sessionKey)
-    }
-
-    if (actionIntent && allowedIntents.has(actionIntent)) {
-      const resolvedIntent = actionIntent
-      const handler = intentHandlers[resolvedIntent] || intentHandlers.OUT_OF_SCOPE
-      const { action, actionHint, launchTarget } = handler({ message, user })
-      const actionUrl = intentToActionUrl[resolvedIntent] ?? null
-      const buttonUrl =
-        actionUrl || buildCallvuSlugUrl(resolvedIntent, callvuConfig.orgId)
-      const buttonText =
-        buttonUrl ? intentButtonText[resolvedIntent] ?? 'Open Form' : null
-
-      return res.json({
-        reply: safeReplyForIntent(resolvedIntent),
-        assistantMessage: safeReplyForIntent(resolvedIntent),
-        intent: resolvedIntent,
-        entities: null,
-        requestedTool: null,
-        toolArguments: null,
-        toolResult: null,
-        toolError: null,
-        action,
-        actionHint,
-        launchTarget,
-        mcpConfigured: hasCallvuConfig,
-        suggestedNextSteps: getSuggestedNextSteps(resolvedIntent),
-        message: safeReplyForIntent(resolvedIntent),
-        actionUrl,
-        buttonText,
-        button: buttonUrl
-          ? {
-              label: buttonText,
-              url: buttonUrl,
-              openInNewWindow: true,
-            }
-          : null,
-      })
-    }
-
+    // Payment flow: ask type, then launch on selection.
     if (isGenericPaymentRequest(message)) {
-      pendingPaymentBySession.set(sessionKey, { type: 'payment' })
+      paymentFlowBySession.set(sessionKey, { step: 'await_type' })
       const choiceResponse = buildPaymentChoiceResponse()
-      return res.json({
-        ...choiceResponse,
-        assistantMessage: choiceResponse.reply,
-        message: choiceResponse.reply,
-        button: null,
-        actionUrl: null,
-        buttonText: null,
-        requestedTool: null,
-        toolArguments: null,
-        toolResult: null,
-        toolError: null,
-        action: intentHandlers.GENERAL_BANKING_QUESTION().action,
-        actionHint: intentHandlers.GENERAL_BANKING_QUESTION().actionHint,
-        launchTarget: intentHandlers.GENERAL_BANKING_QUESTION().launchTarget,
-        mcpConfigured: hasCallvuConfig,
-        suggestedNextSteps: getSuggestedNextSteps('GENERAL_BANKING_QUESTION'),
-      })
+      return res.json(
+        buildChatResponse({
+          reply: choiceResponse.reply,
+          intent: choiceResponse.intent,
+          buttons: choiceResponse.buttons,
+        })
+      )
+    }
+
+    const activePaymentFlow = paymentFlowBySession.get(sessionKey)
+    if (activePaymentFlow) {
+      const detectedSubtype = getPaymentSubtypeIntent(message)
+      if (detectedSubtype) {
+        const resolvedIntent =
+          detectedSubtype === 'CHECK_LOAN_PAYMENT' ? 'LOAN_PAYMENT' : detectedSubtype
+        paymentFlowBySession.delete(sessionKey)
+        const actionUrl = intentToActionUrl[resolvedIntent]
+        return res.json(
+          buildChatResponse({
+            reply: safeReplyForIntent(resolvedIntent),
+            intent: resolvedIntent,
+            actionUrl,
+            buttonText: intentButtonText[resolvedIntent] ?? 'Secure Payment Center',
+          })
+        )
+      }
+
+      const choiceResponse = buildPaymentChoiceResponse()
+      return res.json(
+        buildChatResponse({
+          reply: choiceResponse.reply,
+          intent: choiceResponse.intent,
+          buttons: choiceResponse.buttons,
+        })
+      )
+    }
+
+    if (isPaymentAction) {
+      paymentFlowBySession.delete(sessionKey)
+      const resolvedIntent = actionIntent
+      const actionUrl = intentToActionUrl[resolvedIntent]
+      return res.json(
+        buildChatResponse({
+          reply: safeReplyForIntent(resolvedIntent),
+          intent: resolvedIntent,
+          actionUrl,
+          buttonText: intentButtonText[resolvedIntent] ?? 'Secure Payment Center',
+        })
+      )
     }
 
     if (message.toLowerCase().includes('loan payment')) {
       const resolvedIntent = 'CHECK_LOAN_PAYMENT'
-      const handler = intentHandlers[resolvedIntent] || intentHandlers.OUT_OF_SCOPE
-      const { action, actionHint, launchTarget } = handler({ message, user })
       const actionUrl = intentToActionUrl[resolvedIntent]
-      const buttonText = intentButtonText[resolvedIntent]
-      return res.json({
-        reply: safeReplyForIntent(resolvedIntent),
-        assistantMessage: safeReplyForIntent(resolvedIntent),
-        intent: resolvedIntent,
-        entities: null,
-        requestedTool: null,
-        toolArguments: null,
-        toolResult: null,
-        toolError: null,
-        action,
-        actionHint,
-        launchTarget,
-        mcpConfigured: hasCallvuConfig,
-        suggestedNextSteps: getSuggestedNextSteps(resolvedIntent),
-        message: safeReplyForIntent(resolvedIntent),
-        actionUrl,
-        buttonText,
-        button: {
-          label: buttonText,
-          url: actionUrl,
-          openInNewWindow: true,
-        },
-      })
+      return res.json(
+        buildChatResponse({
+          reply: safeReplyForIntent(resolvedIntent),
+          intent: resolvedIntent,
+          actionUrl,
+          buttonText: intentButtonText[resolvedIntent] ?? 'Secure Payment Center',
+        })
+      )
+    }
+
+    // Credit card application flow: type -> features -> launch.
+    const activeCreditFlow = creditCardFlowBySession.get(sessionKey)
+    if (activeCreditFlow) {
+      if (creditCardTypeIntents.includes(actionIntent)) {
+        activeCreditFlow.type = actionIntent
+        activeCreditFlow.step = 'await_feature'
+        creditCardFlowBySession.set(sessionKey, activeCreditFlow)
+        const featureResponse = buildCreditCardFeatureResponse()
+        return res.json(
+          buildChatResponse({
+            reply: featureResponse.reply,
+            intent: featureResponse.intent,
+            buttons: featureResponse.buttons,
+            entities: { cardType: actionIntent },
+          })
+        )
+      }
+
+      if (creditCardFeatureIntents.includes(actionIntent)) {
+        creditCardFlowBySession.delete(sessionKey)
+        const resolvedIntent = 'APPLY_CREDIT_CARD'
+        const actionUrl = intentToActionUrl[resolvedIntent]
+        return res.json(
+          buildChatResponse({
+            reply: safeReplyForIntent(resolvedIntent),
+            intent: resolvedIntent,
+            actionUrl,
+            buttonText: 'Secure Application',
+            entities: { cardFeature: actionIntent, cardType: activeCreditFlow.type },
+          })
+        )
+      }
+
+      const fallbackResponse =
+        activeCreditFlow.step === 'await_feature'
+          ? buildCreditCardFeatureResponse()
+          : buildCreditCardTypeResponse()
+      return res.json(
+        buildChatResponse({
+          reply: fallbackResponse.reply,
+          intent: fallbackResponse.intent,
+          buttons: fallbackResponse.buttons,
+        })
+      )
+    }
+
+    if (isCreditCardApplyRequest(message)) {
+      creditCardFlowBySession.set(sessionKey, { step: 'await_type', type: null })
+      const typeResponse = buildCreditCardTypeResponse()
+      return res.json(
+        buildChatResponse({
+          reply: typeResponse.reply,
+          intent: typeResponse.intent,
+          buttons: typeResponse.buttons,
+        })
+      )
+    }
+
+    if (creditCardTypeIntents.includes(actionIntent)) {
+      creditCardFlowBySession.set(sessionKey, { step: 'await_feature', type: actionIntent })
+      const featureResponse = buildCreditCardFeatureResponse()
+      return res.json(
+        buildChatResponse({
+          reply: featureResponse.reply,
+          intent: featureResponse.intent,
+          buttons: featureResponse.buttons,
+          entities: { cardType: actionIntent },
+        })
+      )
+    }
+
+    if (creditCardFeatureIntents.includes(actionIntent)) {
+      const typeResponse = buildCreditCardTypeResponse()
+      return res.json(
+        buildChatResponse({
+          reply: typeResponse.reply,
+          intent: typeResponse.intent,
+          buttons: typeResponse.buttons,
+        })
+      )
+    }
+
+    // Loan application flow: type -> launch.
+    if (isLoanApplyRequest(message)) {
+      loanApplicationFlowBySession.set(sessionKey, { step: 'await_type' })
+      const typeResponse = buildLoanApplicationTypeResponse()
+      return res.json(
+        buildChatResponse({
+          reply: typeResponse.reply,
+          intent: typeResponse.intent,
+          buttons: typeResponse.buttons,
+        })
+      )
+    }
+
+    if (isLoanAction) {
+      loanApplicationFlowBySession.delete(sessionKey)
+      const resolvedIntent = 'APPLY_LOAN'
+      const actionUrl = intentToActionUrl[resolvedIntent]
+      return res.json(
+        buildChatResponse({
+          reply: safeReplyForIntent(resolvedIntent),
+          intent: resolvedIntent,
+          actionUrl,
+          buttonText: 'Secure Application',
+          entities: { loanType: actionIntent },
+        })
+      )
+    }
+
+    const activeLoanFlow = loanApplicationFlowBySession.get(sessionKey)
+    if (activeLoanFlow) {
+      const typeResponse = buildLoanApplicationTypeResponse()
+      return res.json(
+        buildChatResponse({
+          reply: typeResponse.reply,
+          intent: typeResponse.intent,
+          buttons: typeResponse.buttons,
+        })
+      )
+    }
+
+    // Dispute flow: lost/stolen vs wrong amount -> launch.
+    if (isDisputeRequest(message)) {
+      disputeFlowBySession.set(sessionKey, { step: 'await_answer' })
+      const disputeResponse = buildDisputeQualificationResponse()
+      return res.json(
+        buildChatResponse({
+          reply: disputeResponse.reply,
+          intent: disputeResponse.intent,
+          buttons: disputeResponse.buttons,
+        })
+      )
+    }
+
+    if (isDisputeAction) {
+      disputeFlowBySession.delete(sessionKey)
+      const resolvedIntent = 'DISPUTE_CHARGE'
+      const actionUrl = intentToActionUrl[resolvedIntent]
+      return res.json(
+        buildChatResponse({
+          reply: safeReplyForIntent(resolvedIntent),
+          intent: resolvedIntent,
+          actionUrl,
+          buttonText: 'Dispute Resolution',
+          entities: { disputeAnswer: actionIntent },
+        })
+      )
+    }
+
+    const activeDisputeFlow = disputeFlowBySession.get(sessionKey)
+    if (activeDisputeFlow) {
+      const disputeResponse = buildDisputeQualificationResponse()
+      return res.json(
+        buildChatResponse({
+          reply: disputeResponse.reply,
+          intent: disputeResponse.intent,
+          buttons: disputeResponse.buttons,
+        })
+      )
     }
 
     if (actionIntent && allowedIntents.has(actionIntent)) {
@@ -624,135 +754,63 @@ app.post('/api/chat', async (req, res) => {
       })
     }
 
-    if (isGenericPaymentRequest(message)) {
-      const choiceResponse = buildPaymentChoiceResponse()
-      return res.json({
-        ...choiceResponse,
-        assistantMessage: choiceResponse.reply,
-        message: choiceResponse.reply,
-        button: null,
-        actionUrl: null,
-        buttonText: null,
-        requestedTool: null,
-        toolArguments: null,
-        toolResult: null,
-        toolError: null,
-        action: intentHandlers.GENERAL_BANKING_QUESTION().action,
-        actionHint: intentHandlers.GENERAL_BANKING_QUESTION().actionHint,
-        launchTarget: intentHandlers.GENERAL_BANKING_QUESTION().launchTarget,
-        mcpConfigured: hasCallvuConfig,
-        suggestedNextSteps: getSuggestedNextSteps('GENERAL_BANKING_QUESTION'),
-      })
-    }
     const systemContent = `
 You are the Finova Bank virtual assistant.
-You help customers with:
-- Loan payments
-- Applying for credit cards
-- Applying for loans
-- Contesting credit card charges
+You help customers with banking requests and route them to the best Callvu micro app.
+There are multiple possible micro apps, so you must determine the right one before handoff.
 
-You are professional, concise, friendly, and proactive.
-You NEVER invent account data.
-When an action is required, guide the user step-by-step.
-When appropriate, suggest starting a form or next action.
-If information is missing, ask clear follow-up questions.
-
-You are a digital banking assistant for a modern retail bank. Your job is to help customers with:
-- Loan payments
-- Applying for credit cards
-- Applying for personal or auto loans
-- Disputing credit card charges
-
-You are professional, calm, clear, and action-oriented. You do not guess, invent account data, or promise outcomes. If an action requires account access, ask the user to sign in or confirm authentication.
-
-Always guide the user toward the next best action.
-
-Global response rules:
+Tone and limits:
+- Professional, concise, friendly, and action-oriented
 - Maximum 4 sentences
-- Professional, calm, reassuring tone
-- No emojis
-- No jokes or casual slang
-- Always end with a suggested next step
+- No emojis, no jokes, no slang
 
-Scope guard:
-You may ONLY assist with banking-related topics, including:
-- Bank accounts and balances
-- Loans and loan payments
-- Credit cards and credit card disputes
-- Applications for financial products
-- General banking guidance
+Routing rules:
+- Prefer buttons over free text
+- Ask no more than two qualifying questions per flow
+- If intent is clear, skip questions and proceed
+- End with a confident handoff to the secure Callvu form
+- For credit card applications, ask about desired benefits (cash back, airline miles, low APR) and never ask about annual fees or rate details
 
-Strict scope rule (overrides all other behavior):
-- Only banking-related topics are allowed
-- Off-topic questions must be politely declined
-- Responses must redirect to a banking-related action
+Scope:
+- Banking topics only
+- If off-topic, decline briefly and redirect to payments, applications, or disputes
 
-If a user asks about anything NOT related to banking (for example food, entertainment, personal opinions, or general knowledge), you must:
-1. Politely state that it’s outside your scope
-2. Redirect the conversation back to a relevant banking topic or action
+Below are example interactions that demonstrate the desired flow.
 
-Do not answer off-topic questions, even casually.
+Example 1 – Payment (unspecified)
+User: I want to make a payment.
+Assistant: Sure — what type of account would you like to make a payment on?
+Buttons: Mortgage | Credit Card | Auto Loan | Personal Loan
+User selects: Personal Loan
+Assistant: Got it. I’ll take you to our secure loan payment center.
 
-Use this structure for off-topic requests:
-- One short sentence declining the request
-- One sentence offering help with a banking-related action
-
-Examples:
-User: What’s the best kind of pizza?
-Assistant: That’s not something I can help with, but I’d be happy to assist with a credit card, loan, or managing your accounts.
-
-User: Who’s going to win the Super Bowl?
-Assistant: I can’t help with that, but I can help you apply for a new credit card or review your loan options.
-
-User: Tell me a joke.
-Assistant: I’m here to help with banking needs, but I can assist with payments, applications, or account questions.
-
-Always stay professional, helpful, and focused on banking.
-
-Below are example interactions that demonstrate correct behavior.
-
-Example 1 – Loan payment
-User: I want to make a payment on my auto loan.
-Assistant: I can help with that. Are you looking to make a one-time payment or set up recurring payments? Once you’re signed in, I can walk you through the steps.
-
-Example 2 – Missed payment concern
-User: I think I missed a loan payment.
-Assistant: I can help you review that. Please sign in so I can check your payment history and see what options are available to you.
+Example 2 – Payment (specified)
+User: I need to make a loan payment.
+Assistant: No problem — I’ll take you to our secure loan payment center.
 
 Example 3 – Credit card application
-User: How do I apply for a credit card?
-Assistant: You can apply directly online in just a few minutes. I can start a credit card application for you now, or answer questions about available card options before you begin.
+User: I want to apply for a credit card.
+Assistant: What type of card are you looking for?
+Buttons: Personal | Business
+User selects: Personal
+Assistant: Which features matter most to you?
+Buttons: Cash Back | Airline Miles | Low APR
+Assistant: Great choice — let’s get your application started.
 
-Example 4 – Credit card eligibility question
-User: Will I be approved for a credit card?
-Assistant: Approval depends on a review of your application and credit profile. I can help you start an application or explain what information is typically reviewed.
+Example 4 – Loan application
+User: I’d like to apply for a loan.
+Assistant: What type of loan are you interested in?
+Buttons: Personal Loan | Auto Loan | Home Equity
+User selects: Auto Loan
+Assistant: Perfect — I’ll take you to our secure loan application.
 
-Example 5 – Loan application
-User: I want to apply for a personal loan.
-Assistant: I can help with that. Would you like to apply for a personal loan now, or review loan amounts, terms, and requirements first?
+Example 5 – Dispute a charge
+User: I need to dispute a charge.
+Assistant: Is this a dispute because the card was lost/stolen, or is the charge amount incorrect?
+Buttons: Lost/Stolen | Wrong Amount
+Assistant: Thanks — let’s get that dispute started.
 
-Example 6 – Loan status
-User: What’s going on with my loan application?
-Assistant: I can check the status once you’re signed in. Loan applications are reviewed individually, and I’ll show you the latest update available.
-
-Example 7 – Disputing a charge
-User: There’s a charge on my credit card I don’t recognize.
-Assistant: I’m sorry about that. I can help you dispute a charge. Once you’re signed in, I’ll ask you to confirm the transaction details so we can start the dispute process.
-
-Example 8 – Duplicate charge
-User: I was charged twice for the same purchase.
-Assistant: Thanks for letting me know. After you sign in, I can help you review the transactions and submit a dispute for the duplicate charge if needed.
-
-Example 9 – Payment hardship
-User: I’m having trouble making my loan payments.
-Assistant: I’m glad you reached out. There may be options available depending on your situation. Please sign in so I can review your loan and explain potential next steps.
-
-Example 10 – General guidance
-User: What can you help me with?
-Assistant: I can help you make loan payments, apply for loans or credit cards, and dispute credit card charges. Let me know what you’d like to do.
-
-Use these examples as guidance for tone, structure, and flow. Always be clear, accurate, and focused on helping the user complete their task.
+Use these examples as guidance for tone, structure, and flow.
 `.trim()
     const userContext = {
       isAuthenticated: Boolean(user?.isAuthenticated ?? false),
