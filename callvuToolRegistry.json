@@ -1,0 +1,71 @@
+{
+  "tools": [
+    {
+      "name": "getForms",
+      "description": "List available forms for the organization.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "number", "description": "Max number of forms." },
+          "offset": { "type": "number", "description": "Pagination offset." }
+        },
+        "additionalProperties": false
+      },
+      "endpoint": {
+        "method": "GET",
+        "path": "/orgs/{orgId}/forms"
+      }
+    },
+    {
+      "name": "getFormDetails",
+      "description": "Get details for a specific form.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "formId": { "type": "string", "description": "Form identifier." }
+        },
+        "required": ["formId"],
+        "additionalProperties": false
+      },
+      "endpoint": {
+        "method": "GET",
+        "path": "/orgs/{orgId}/forms/{formId}"
+      }
+    },
+    {
+      "name": "launchForm",
+      "description": "Launch a form session for a user.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "formId": { "type": "string", "description": "Form identifier." },
+          "userId": { "type": "string", "description": "User identifier." },
+          "metadata": { "type": "object", "description": "Optional launch metadata." }
+        },
+        "required": ["formId"],
+        "additionalProperties": false
+      },
+      "endpoint": {
+        "method": "POST",
+        "path": "/orgs/{orgId}/forms/{formId}/launch"
+      }
+    },
+    {
+      "name": "getFormAnalytics",
+      "description": "Get analytics for a specific form.",
+      "inputs": {
+        "type": "object",
+        "properties": {
+          "formId": { "type": "string", "description": "Form identifier." },
+          "range": { "type": "string", "description": "Time range (e.g., 7d, 30d)." }
+        },
+        "required": ["formId"],
+        "additionalProperties": false
+      },
+      "endpoint": {
+        "method": "GET",
+        "path": "/orgs/{orgId}/forms/{formId}/analytics"
+      }
+    }
+  ]
+}
