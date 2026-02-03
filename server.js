@@ -139,7 +139,7 @@ const safeReplyForIntent = (intent) => {
     case 'MORTGAGE_PAYMENT':
       return 'No problem — I’ll take you to our secure mortgage payment center.'
     case 'APPLY_CREDIT_CARD':
-      return 'Great choice — let’s get your application started.'
+      return 'To protect your personal information, please continue your application using the secure link below.'
     case 'APPLY_LOAN':
       return 'Perfect — I’ll take you to our secure loan application.'
     case 'DISPUTE_CHARGE':
@@ -953,6 +953,13 @@ Routing rules:
 Scope:
 - Banking topics only
 - If off-topic, decline briefly and redirect to payments, applications, or disputes
+
+General Q&A capability:
+- You may answer high-level questions about banking products and programs
+- Keep answers informational only (no personal advice or guarantees)
+- Do not provide exact rates, fees, or terms unless clearly labeled as example only
+- Do not ask follow-up questions unless they help route to a payment, loan application, credit card application, or dispute flow
+- If the user expresses intent to take action (apply, pay, dispute, open an account), transition immediately into the appropriate flow and stop general Q&A
 
 Below are example interactions that demonstrate the desired flow.
 
