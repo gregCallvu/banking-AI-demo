@@ -41,6 +41,12 @@ function ChatPanel({
   isSending,
   hasActionButton,
   onActionButton,
+  inputPlaceholder,
+  inputHelperText,
+  inputType,
+  inputMode,
+  inputMaxLength,
+  isInputLocked,
 }) {
   const endRef = useRef(null)
 
@@ -89,6 +95,12 @@ function ChatPanel({
               }`}
             >
               {message.text}
+              {message.isLoading && (
+                <span className="mt-2 inline-flex items-center gap-2 text-xs text-finova-muted">
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-finova-primary border-t-transparent" />
+                  Processing
+                </span>
+              )}
               {message.role === 'bot' && message.buttons?.length > 0 && (
                 <div className="mt-3 flex flex-col gap-2">
                   {message.buttons.map((button) => (
@@ -108,6 +120,10 @@ function ChatPanel({
                   href={message.button.url}
                   target={message.button.openInNewWindow ? '_blank' : '_self'}
                   rel="noreferrer"
+                  onClick={(event) => {
+                    event.preventDefault()
+                    onActionButton?.(message.button)
+                  }}
                   className="mt-3 inline-flex w-full items-center justify-center rounded-full bg-[#4285F4] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-white shadow-sm transition hover:bg-finova-primary/90"
                 >
                   {message.button.label}
@@ -125,21 +141,26 @@ function ChatPanel({
       >
         <div className="flex items-center gap-2">
           <input
-            type="text"
+            type={inputType ?? 'text'}
             value={input}
             onChange={onInputChange}
-            placeholder="Type your message..."
+            placeholder={inputPlaceholder ?? 'Type your message...'}
+            inputMode={inputMode}
+            maxLength={inputMaxLength}
             className="flex-1 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-finova-text outline-none transition focus:border-finova-accent focus:ring-2 focus:ring-finova-accent/20"
-            disabled={isSending}
+            disabled={isSending || isInputLocked}
           />
           <button
             type="submit"
-            disabled={isSending || input.trim().length === 0}
+            disabled={isSending || isInputLocked || input.trim().length === 0}
             className="rounded-full bg-[#4285F4] px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white shadow-sm transition hover:bg-finova-primary/90 disabled:cursor-not-allowed disabled:bg-slate-300"
           >
             {isSending ? 'Sending' : 'Send'}
           </button>
         </div>
+        {inputHelperText && (
+          <p className="mt-2 text-xs text-finova-muted">{inputHelperText}</p>
+        )}
       </form>
     </aside>
   )
@@ -155,6 +176,8 @@ function Home({ onSignIn }) {
   const [chatInput, setChatInput] = useState('')
   const [messages, setMessages] = useState(initialMessages)
   const [isSendingChat, setIsSendingChat] = useState(false)
+  const [activeInputRequest, setActiveInputRequest] = useState(null)
+  const [isEligibilityLoading, setIsEligibilityLoading] = useState(false)
   const [offerIndex, setOfferIndex] = useState(0)
   const canSubmit = useMemo(() => {
     return username.trim().length > 0 && password.trim().length > 0
@@ -219,6 +242,7 @@ function Home({ onSignIn }) {
         text:
           payload.reply ||
           'Sorry, I could not get a response from the assistant.',
+        isLoading: Boolean(payload.loading),
         button: payload.button
           ? {
               ...payload.button,
@@ -228,6 +252,26 @@ function Home({ onSignIn }) {
         buttons: payload.buttons ?? null,
       }
       setMessages((prev) => [...prev, botMessage])
+      setActiveInputRequest(payload.inputRequest ?? null)
+
+      if (payload.loading) {
+        setIsEligibilityLoading(true)
+        setActiveInputRequest(null)
+        const duration = Number(payload.loading.durationMs) || 5000
+        window.setTimeout(() => {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `bot-${Date.now() + 2}`,
+              role: 'bot',
+              text: payload.loading.approvalMessage,
+            },
+          ])
+          setIsEligibilityLoading(false)
+        }, duration)
+      } else {
+        setIsEligibilityLoading(false)
+      }
     } catch (error) {
       setMessages((prev) => [
         ...prev,
@@ -250,9 +294,28 @@ function Home({ onSignIn }) {
     await sendChatMessage({ text: trimmed })
   }
 
+  const handleChatInputChange = (event) => {
+    const nextValue = event.target.value
+    if (activeInputRequest?.inputMode === 'numeric') {
+      const digitsOnly = nextValue.replace(/\D/g, '')
+      const maxLength = activeInputRequest?.maxLength ?? 4
+      setChatInput(digitsOnly.slice(0, maxLength))
+      return
+    }
+    setChatInput(nextValue)
+  }
+
   const handleActionButton = async (button) => {
     if (button.url) {
       window.open(button.url, '_blank', 'noopener,noreferrer')
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `bot-${Date.now() + 1}`,
+          role: 'bot',
+          text: 'Is there anything else I can help you with today?',
+        },
+      ])
       return
     }
     if (button.actionIntent) {
@@ -494,10 +557,16 @@ function Home({ onSignIn }) {
         isOpen={isChatOpen}
         messages={messages}
         input={chatInput}
-        onInputChange={(event) => setChatInput(event.target.value)}
+        onInputChange={handleChatInputChange}
         onSend={handleSendMessage}
         onClose={() => setIsChatOpen(false)}
         isSending={isSendingChat}
+        isInputLocked={isEligibilityLoading}
+        inputPlaceholder={activeInputRequest?.placeholder}
+        inputHelperText={activeInputRequest?.helperText}
+        inputType={activeInputRequest?.mask ? 'password' : 'text'}
+        inputMode={activeInputRequest?.inputMode}
+        inputMaxLength={activeInputRequest?.maxLength}
         hasActionButton={messages.some(
           (message) => Boolean(message.button) || (message.buttons?.length ?? 0) > 0
         )}

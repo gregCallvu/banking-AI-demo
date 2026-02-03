@@ -87,13 +87,16 @@ const getFallbackReply = () =>
 const buildChatResponse = ({
   reply,
   intent,
+  user = null,
   buttons = null,
   actionUrl = null,
   buttonText = null,
   entities = null,
+  inputRequest = null,
+  loading = null,
 }) => {
   const handler = intentHandlers[intent] || intentHandlers.GENERAL_BANKING_QUESTION
-  const { action, actionHint, launchTarget } = handler({ message: reply })
+  const { action, actionHint, launchTarget } = handler({ message: reply, user })
   return {
     reply,
     assistantMessage: reply,
@@ -119,6 +122,8 @@ const buildChatResponse = ({
         }
       : null,
     buttons,
+    inputRequest,
+    loading,
   }
 }
 const safeReplyForIntent = (intent) => {
@@ -190,10 +195,27 @@ const paymentFlowBySession = new Map()
 const loanApplicationFlowBySession = new Map()
 const disputeFlowBySession = new Map()
 
-const isCreditCardApplyRequest = (text) => {
+const isCreditCardMention = (text) => {
   const msg = text.toLowerCase()
   if (msg.includes('debit')) return false
-  const hasCreditCard = msg.includes('credit card') || msg.includes('card')
+  return (
+    msg.includes('credit card') ||
+    msg.includes('my card') ||
+    msg.includes('card') ||
+    msg.includes('visa') ||
+    msg.includes('mastercard')
+  )
+}
+
+const isCreditCardPaymentRequest = (text) => {
+  const msg = text.toLowerCase()
+  if (!isCreditCardMention(msg)) return false
+  return msg.includes('pay') || msg.includes('payment') || msg.includes('make a payment')
+}
+
+const isCreditCardApplyRequest = (text) => {
+  const msg = text.toLowerCase()
+  if (!isCreditCardMention(msg)) return false
   const applySignals =
     msg.includes('apply') ||
     msg.includes('application') ||
@@ -202,8 +224,11 @@ const isCreditCardApplyRequest = (text) => {
     msg.includes('get a') ||
     msg.includes('open a') ||
     msg.includes('new card')
-  return hasCreditCard && applySignals
+  return applySignals
 }
+
+const isCreditCardAmbiguous = (text) =>
+  isCreditCardMention(text) && !isCreditCardPaymentRequest(text) && !isCreditCardApplyRequest(text)
 
 const isLoanApplyRequest = (text) => {
   const msg = text.toLowerCase()
@@ -254,8 +279,17 @@ const buildPaymentChoiceResponse = () => ({
   ],
 })
 
+const buildCreditCardIntentResponse = () => ({
+  reply: 'What would you like to do with your credit card?',
+  intent: 'GENERAL_BANKING_QUESTION',
+  buttons: [
+    { label: 'Make a Payment', actionIntent: 'CREDIT_CARD_INTENT_PAYMENT' },
+    { label: 'Apply for a Credit Card', actionIntent: 'CREDIT_CARD_INTENT_APPLY' },
+  ],
+})
+
 const buildCreditCardTypeResponse = () => ({
-  reply: 'What type of card are you looking for?',
+  reply: 'Is this a personal or business credit card?',
   intent: 'APPLY_CREDIT_CARD',
   buttons: [
     { label: 'Personal', actionIntent: 'CREDIT_CARD_TYPE_PERSONAL' },
@@ -264,21 +298,21 @@ const buildCreditCardTypeResponse = () => ({
 })
 
 const buildCreditCardFeatureResponse = () => ({
-  reply: 'Which card features matter most to you?',
+  reply: 'Which features matter most to you?',
   intent: 'APPLY_CREDIT_CARD',
   buttons: [
-    { label: 'Cash Back', actionIntent: 'CREDIT_CARD_FEATURE_CASH_BACK' },
+    { label: 'Rewards', actionIntent: 'CREDIT_CARD_FEATURE_REWARDS' },
     { label: 'Airline Miles', actionIntent: 'CREDIT_CARD_FEATURE_AIRLINE_MILES' },
-    { label: 'Low APR', actionIntent: 'CREDIT_CARD_FEATURE_LOW_APR' },
+    { label: 'Intro APR', actionIntent: 'CREDIT_CARD_FEATURE_INTRO_APR' },
   ],
 })
 
 const buildLoanApplicationTypeResponse = () => ({
-  reply: 'What type of loan are you interested in?',
+  reply: 'What type of loan would you like to apply for?',
   intent: 'APPLY_LOAN',
   buttons: [
     { label: 'Personal Loan', actionIntent: 'LOAN_TYPE_PERSONAL' },
-    { label: 'Home Equity', actionIntent: 'LOAN_TYPE_HOME_EQUITY' },
+    { label: 'Credit Card', actionIntent: 'LOAN_TYPE_CREDIT_CARD' },
     { label: 'Auto Loan', actionIntent: 'LOAN_TYPE_AUTO' },
   ],
 })
@@ -300,14 +334,30 @@ const paymentActionIntents = [
   'LOAN_PAYMENT',
 ]
 
+const creditCardIntentIntents = ['CREDIT_CARD_INTENT_PAYMENT', 'CREDIT_CARD_INTENT_APPLY']
 const creditCardTypeIntents = ['CREDIT_CARD_TYPE_PERSONAL', 'CREDIT_CARD_TYPE_BUSINESS']
 const creditCardFeatureIntents = [
-  'CREDIT_CARD_FEATURE_CASH_BACK',
+  'CREDIT_CARD_FEATURE_REWARDS',
   'CREDIT_CARD_FEATURE_AIRLINE_MILES',
-  'CREDIT_CARD_FEATURE_LOW_APR',
+  'CREDIT_CARD_FEATURE_INTRO_APR',
 ]
-const loanTypeIntents = ['LOAN_TYPE_PERSONAL', 'LOAN_TYPE_HOME_EQUITY', 'LOAN_TYPE_AUTO']
+const loanTypeIntents = ['LOAN_TYPE_PERSONAL', 'LOAN_TYPE_CREDIT_CARD', 'LOAN_TYPE_AUTO']
 const disputeAnswerIntents = ['DISPUTE_LOST_STOLEN', 'DISPUTE_WRONG_AMOUNT']
+
+const loanEligibilityByType = {
+  LOAN_TYPE_PERSONAL: {
+    label: 'Personal Loan',
+    approval: 'You’re approved for up to $20,000',
+  },
+  LOAN_TYPE_CREDIT_CARD: {
+    label: 'Credit Card',
+    approval: 'You’re approved for up to $10,000',
+  },
+  LOAN_TYPE_AUTO: {
+    label: 'Auto Loan',
+    approval: 'You’re approved for up to $30,000',
+  },
+}
 
 const intentHandlers = {
   CHECK_LOAN_PAYMENT: ({ user }) => ({
@@ -406,6 +456,8 @@ const intentHandlers = {
       requiresAuth: false,
       nextStep: 'clarify_request',
     },
+    actionHint: 'I can help with payments, applications, or disputes.',
+    launchTarget: 'general_banking',
   }),
   OUT_OF_SCOPE: () => ({
     action: {
@@ -413,6 +465,8 @@ const intentHandlers = {
       requiresAuth: false,
       nextStep: 'redirect_to_banking',
     },
+    actionHint: 'I can help with banking-related requests only.',
+    launchTarget: 'redirect_to_banking',
   }),
 }
 
@@ -463,20 +517,30 @@ app.post('/api/chat', async (req, res) => {
 
   try {
     const sessionKey = getSessionKey(req)
+    const buildResponse = (payload) => buildChatResponse({ ...payload, user })
 
     const isPaymentAction = paymentActionIntents.includes(actionIntent)
     const isCreditCardAction =
-      creditCardTypeIntents.includes(actionIntent) || creditCardFeatureIntents.includes(actionIntent)
+      creditCardIntentIntents.includes(actionIntent) ||
+      creditCardTypeIntents.includes(actionIntent) ||
+      creditCardFeatureIntents.includes(actionIntent)
     const isLoanAction = loanTypeIntents.includes(actionIntent)
     const isDisputeAction = disputeAnswerIntents.includes(actionIntent)
+    const shouldHandleCreditCard = !isLoanAction
 
     // Reset flows if user changes intent mid-flow.
-    if (isCreditCardApplyRequest(message) || isCreditCardAction) {
-      loanApplicationFlowBySession.delete(sessionKey)
+    if (isLoanApplyRequest(message) || isLoanAction) {
+      creditCardFlowBySession.delete(sessionKey)
       disputeFlowBySession.delete(sessionKey)
       paymentFlowBySession.delete(sessionKey)
-    } else if (isLoanApplyRequest(message) || isLoanAction) {
-      creditCardFlowBySession.delete(sessionKey)
+    } else if (
+      shouldHandleCreditCard &&
+      (isCreditCardApplyRequest(message) ||
+        isCreditCardPaymentRequest(message) ||
+        isCreditCardAmbiguous(message) ||
+        isCreditCardAction)
+    ) {
+      loanApplicationFlowBySession.delete(sessionKey)
       disputeFlowBySession.delete(sessionKey)
       paymentFlowBySession.delete(sessionKey)
     } else if (isDisputeRequest(message) || isDisputeAction) {
@@ -494,7 +558,7 @@ app.post('/api/chat', async (req, res) => {
       paymentFlowBySession.set(sessionKey, { step: 'await_type' })
       const choiceResponse = buildPaymentChoiceResponse()
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: choiceResponse.reply,
           intent: choiceResponse.intent,
           buttons: choiceResponse.buttons,
@@ -511,7 +575,7 @@ app.post('/api/chat', async (req, res) => {
         paymentFlowBySession.delete(sessionKey)
         const actionUrl = intentToActionUrl[resolvedIntent]
         return res.json(
-          buildChatResponse({
+          buildResponse({
             reply: safeReplyForIntent(resolvedIntent),
             intent: resolvedIntent,
             actionUrl,
@@ -522,7 +586,7 @@ app.post('/api/chat', async (req, res) => {
 
       const choiceResponse = buildPaymentChoiceResponse()
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: choiceResponse.reply,
           intent: choiceResponse.intent,
           buttons: choiceResponse.buttons,
@@ -535,7 +599,7 @@ app.post('/api/chat', async (req, res) => {
       const resolvedIntent = actionIntent
       const actionUrl = intentToActionUrl[resolvedIntent]
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: safeReplyForIntent(resolvedIntent),
           intent: resolvedIntent,
           actionUrl,
@@ -548,7 +612,7 @@ app.post('/api/chat', async (req, res) => {
       const resolvedIntent = 'CHECK_LOAN_PAYMENT'
       const actionUrl = intentToActionUrl[resolvedIntent]
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: safeReplyForIntent(resolvedIntent),
           intent: resolvedIntent,
           actionUrl,
@@ -557,8 +621,64 @@ app.post('/api/chat', async (req, res) => {
       )
     }
 
+    // Credit card payment: immediate handoff.
+    if (shouldHandleCreditCard && isCreditCardPaymentRequest(message)) {
+      creditCardFlowBySession.delete(sessionKey)
+      const resolvedIntent = 'CREDIT_CARD_PAYMENT'
+      const actionUrl = intentToActionUrl[resolvedIntent]
+      return res.json(
+        buildResponse({
+          reply: 'I’ll take you to our secure credit card payment center.',
+          intent: resolvedIntent,
+          actionUrl,
+          buttonText: intentButtonText[resolvedIntent] ?? 'Secure Payment Center',
+        })
+      )
+    }
+
+    // Credit card intent disambiguation.
+    if (shouldHandleCreditCard && isCreditCardAmbiguous(message)) {
+      creditCardFlowBySession.set(sessionKey, { step: 'await_intent' })
+      const intentResponse = buildCreditCardIntentResponse()
+      return res.json(
+        buildResponse({
+          reply: intentResponse.reply,
+          intent: intentResponse.intent,
+          buttons: intentResponse.buttons,
+        })
+      )
+    }
+
+    if (shouldHandleCreditCard && actionIntent === 'CREDIT_CARD_INTENT_PAYMENT') {
+      creditCardFlowBySession.delete(sessionKey)
+      const resolvedIntent = 'CREDIT_CARD_PAYMENT'
+      const actionUrl = intentToActionUrl[resolvedIntent]
+      return res.json(
+        buildResponse({
+          reply: 'I’ll take you to our secure credit card payment center.',
+          intent: resolvedIntent,
+          actionUrl,
+          buttonText: intentButtonText[resolvedIntent] ?? 'Secure Payment Center',
+        })
+      )
+    }
+
+    if (shouldHandleCreditCard && actionIntent === 'CREDIT_CARD_INTENT_APPLY') {
+      creditCardFlowBySession.set(sessionKey, { step: 'await_type', type: null })
+      const typeResponse = buildCreditCardTypeResponse()
+      return res.json(
+        buildResponse({
+          reply: typeResponse.reply,
+          intent: typeResponse.intent,
+          buttons: typeResponse.buttons,
+        })
+      )
+    }
+
     // Credit card application flow: type -> features -> launch.
-    const activeCreditFlow = creditCardFlowBySession.get(sessionKey)
+    const activeCreditFlow = shouldHandleCreditCard
+      ? creditCardFlowBySession.get(sessionKey)
+      : null
     if (activeCreditFlow) {
       if (creditCardTypeIntents.includes(actionIntent)) {
         activeCreditFlow.type = actionIntent
@@ -566,7 +686,7 @@ app.post('/api/chat', async (req, res) => {
         creditCardFlowBySession.set(sessionKey, activeCreditFlow)
         const featureResponse = buildCreditCardFeatureResponse()
         return res.json(
-          buildChatResponse({
+          buildResponse({
             reply: featureResponse.reply,
             intent: featureResponse.intent,
             buttons: featureResponse.buttons,
@@ -580,7 +700,7 @@ app.post('/api/chat', async (req, res) => {
         const resolvedIntent = 'APPLY_CREDIT_CARD'
         const actionUrl = intentToActionUrl[resolvedIntent]
         return res.json(
-          buildChatResponse({
+          buildResponse({
             reply: safeReplyForIntent(resolvedIntent),
             intent: resolvedIntent,
             actionUrl,
@@ -595,7 +715,7 @@ app.post('/api/chat', async (req, res) => {
           ? buildCreditCardFeatureResponse()
           : buildCreditCardTypeResponse()
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: fallbackResponse.reply,
           intent: fallbackResponse.intent,
           buttons: fallbackResponse.buttons,
@@ -603,11 +723,11 @@ app.post('/api/chat', async (req, res) => {
       )
     }
 
-    if (isCreditCardApplyRequest(message)) {
+    if (shouldHandleCreditCard && isCreditCardApplyRequest(message)) {
       creditCardFlowBySession.set(sessionKey, { step: 'await_type', type: null })
       const typeResponse = buildCreditCardTypeResponse()
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: typeResponse.reply,
           intent: typeResponse.intent,
           buttons: typeResponse.buttons,
@@ -615,11 +735,11 @@ app.post('/api/chat', async (req, res) => {
       )
     }
 
-    if (creditCardTypeIntents.includes(actionIntent)) {
+    if (shouldHandleCreditCard && creditCardTypeIntents.includes(actionIntent)) {
       creditCardFlowBySession.set(sessionKey, { step: 'await_feature', type: actionIntent })
       const featureResponse = buildCreditCardFeatureResponse()
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: featureResponse.reply,
           intent: featureResponse.intent,
           buttons: featureResponse.buttons,
@@ -628,10 +748,10 @@ app.post('/api/chat', async (req, res) => {
       )
     }
 
-    if (creditCardFeatureIntents.includes(actionIntent)) {
+    if (shouldHandleCreditCard && creditCardFeatureIntents.includes(actionIntent)) {
       const typeResponse = buildCreditCardTypeResponse()
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: typeResponse.reply,
           intent: typeResponse.intent,
           buttons: typeResponse.buttons,
@@ -639,12 +759,12 @@ app.post('/api/chat', async (req, res) => {
       )
     }
 
-    // Loan application flow: type -> launch.
+    // Loan application flow: type -> inputs -> eligibility.
     if (isLoanApplyRequest(message)) {
       loanApplicationFlowBySession.set(sessionKey, { step: 'await_type' })
       const typeResponse = buildLoanApplicationTypeResponse()
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: typeResponse.reply,
           intent: typeResponse.intent,
           buttons: typeResponse.buttons,
@@ -652,16 +772,23 @@ app.post('/api/chat', async (req, res) => {
       )
     }
 
-    if (isLoanAction) {
-      loanApplicationFlowBySession.delete(sessionKey)
-      const resolvedIntent = 'APPLY_LOAN'
-      const actionUrl = intentToActionUrl[resolvedIntent]
+    if (loanTypeIntents.includes(actionIntent)) {
+      loanApplicationFlowBySession.set(sessionKey, {
+        step: 'await_name',
+        loanType: actionIntent,
+        answers: {},
+      })
       return res.json(
-        buildChatResponse({
-          reply: safeReplyForIntent(resolvedIntent),
-          intent: resolvedIntent,
-          actionUrl,
-          buttonText: 'Secure Application',
+        buildResponse({
+          reply: 'What is your full name?',
+          intent: 'APPLY_LOAN',
+          inputRequest: {
+            id: 'loan_full_name',
+            inputMode: 'text',
+            placeholder: 'Full name',
+            mask: false,
+            helperText: null,
+          },
           entities: { loanType: actionIntent },
         })
       )
@@ -669,14 +796,64 @@ app.post('/api/chat', async (req, res) => {
 
     const activeLoanFlow = loanApplicationFlowBySession.get(sessionKey)
     if (activeLoanFlow) {
-      const typeResponse = buildLoanApplicationTypeResponse()
-      return res.json(
-        buildChatResponse({
-          reply: typeResponse.reply,
-          intent: typeResponse.intent,
-          buttons: typeResponse.buttons,
-        })
-      )
+      if (activeLoanFlow.step === 'await_name') {
+        activeLoanFlow.answers.fullName = message.trim()
+        activeLoanFlow.step = 'await_dob'
+        loanApplicationFlowBySession.set(sessionKey, activeLoanFlow)
+        return res.json(
+          buildResponse({
+            reply: 'What is your date of birth?',
+            intent: 'APPLY_LOAN',
+            inputRequest: {
+              id: 'loan_dob',
+              inputMode: 'text',
+              placeholder: 'MM/DD/YYYY',
+              mask: false,
+              helperText: null,
+            },
+            entities: { loanType: activeLoanFlow.loanType },
+          })
+        )
+      }
+
+      if (activeLoanFlow.step === 'await_dob') {
+        activeLoanFlow.answers.dob = message.trim()
+        activeLoanFlow.step = 'await_ssn_last4'
+        loanApplicationFlowBySession.set(sessionKey, activeLoanFlow)
+        return res.json(
+          buildResponse({
+            reply: 'Please enter the last 4 digits of your SSN (soft check only)',
+            intent: 'APPLY_LOAN',
+            inputRequest: {
+              id: 'loan_ssn_last4',
+              inputMode: 'numeric',
+              placeholder: 'Last 4 digits',
+              mask: true,
+              helperText: 'This is a simulated soft check. Do not enter your full SSN.',
+              maxLength: 4,
+            },
+            entities: { loanType: activeLoanFlow.loanType },
+          })
+        )
+      }
+
+      if (activeLoanFlow.step === 'await_ssn_last4') {
+        const last4 = message.replace(/\D/g, '').slice(0, 4)
+        const loanType = activeLoanFlow.loanType
+        const approval = loanEligibilityByType[loanType]
+        loanApplicationFlowBySession.delete(sessionKey)
+        return res.json(
+          buildResponse({
+            reply: 'Checking eligibility',
+            intent: 'APPLY_LOAN',
+            loading: {
+              durationMs: 5000,
+              approvalMessage: `Simulated approval for ${approval.label}: ${approval.approval}.`,
+            },
+            entities: { loanType, last4 },
+          })
+        )
+      }
     }
 
     // Dispute flow: lost/stolen vs wrong amount -> launch.
@@ -684,7 +861,7 @@ app.post('/api/chat', async (req, res) => {
       disputeFlowBySession.set(sessionKey, { step: 'await_answer' })
       const disputeResponse = buildDisputeQualificationResponse()
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: disputeResponse.reply,
           intent: disputeResponse.intent,
           buttons: disputeResponse.buttons,
@@ -697,7 +874,7 @@ app.post('/api/chat', async (req, res) => {
       const resolvedIntent = 'DISPUTE_CHARGE'
       const actionUrl = intentToActionUrl[resolvedIntent]
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: safeReplyForIntent(resolvedIntent),
           intent: resolvedIntent,
           actionUrl,
@@ -711,7 +888,7 @@ app.post('/api/chat', async (req, res) => {
     if (activeDisputeFlow) {
       const disputeResponse = buildDisputeQualificationResponse()
       return res.json(
-        buildChatResponse({
+        buildResponse({
           reply: disputeResponse.reply,
           intent: disputeResponse.intent,
           buttons: disputeResponse.buttons,
@@ -769,7 +946,9 @@ Routing rules:
 - Ask no more than two qualifying questions per flow
 - If intent is clear, skip questions and proceed
 - End with a confident handoff to the secure Callvu form
-- For credit card applications, ask about desired benefits (cash back, airline miles, low APR) and never ask about annual fees or rate details
+- If credit card intent is unclear, ask whether the user wants to make a payment or apply
+- For credit card applications, ask about desired benefits (rewards, airline miles, intro APR) and never ask about annual fees or rate details
+- For loan applications, collect loan type, full name, date of birth, and last 4 of SSN for a simulated soft check only
 
 Scope:
 - Banking topics only
@@ -790,19 +969,22 @@ Assistant: No problem — I’ll take you to our secure loan payment center.
 
 Example 3 – Credit card application
 User: I want to apply for a credit card.
-Assistant: What type of card are you looking for?
+Assistant: Is this a personal or business credit card?
 Buttons: Personal | Business
 User selects: Personal
 Assistant: Which features matter most to you?
-Buttons: Cash Back | Airline Miles | Low APR
+Buttons: Rewards | Airline Miles | Intro APR
 Assistant: Great choice — let’s get your application started.
 
 Example 4 – Loan application
 User: I’d like to apply for a loan.
-Assistant: What type of loan are you interested in?
-Buttons: Personal Loan | Auto Loan | Home Equity
+Assistant: What type of loan would you like to apply for?
+Buttons: Personal Loan | Credit Card | Auto Loan
 User selects: Auto Loan
-Assistant: Perfect — I’ll take you to our secure loan application.
+Assistant: What is your full name?
+Assistant: What is your date of birth?
+Assistant: Please enter the last 4 digits of your SSN (soft check only)
+Assistant: Simulated approval for Auto Loan: You’re approved for up to $30,000.
 
 Example 5 – Dispute a charge
 User: I need to dispute a charge.
