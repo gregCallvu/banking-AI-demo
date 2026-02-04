@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "CallVU Studio": {
+      "url": "https://mcp.callvu.net",
+      "auth": "interactive"
+    }
+  }
+}

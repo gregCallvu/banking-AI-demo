@@ -1,17 +1,9 @@
 import OpenAI from 'openai'
-import fs from 'fs'
-import path from 'path'
-import { createCallvuMcpClient } from './callvuMcpClient.js'
-import { buildCallvuFormUrl, callvuFormMapping } from './callvuFormMapping.js'
-import { intentToFormSlug, buildCallvuFormUrl as buildCallvuSlugUrl } from './intentToFormSlug.js'
-import { intentToActionUrl } from './intentToActionUrl.js'
-
-const callvuToolRegistry = JSON.parse(
-  fs.readFileSync(path.resolve('./callvuToolRegistry.json'), 'utf8')
-)
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
+import { intentToActionUrl } from './intentToActionUrl.js'
+import { createCallvuMcpClient } from './callvuMcpClient.js'
 
 dotenv.config()
 
@@ -27,11 +19,999 @@ const hasCallvuConfig = Boolean(
   callvuConfig.orgId && callvuConfig.token && callvuConfig.baseUrl
 )
 
-if (!hasCallvuConfig) {
-  console.warn(
-    'Callvu MCP config missing. MCP actions will remain disabled.'
+app.use(cors())
+app.use(express.json())
+
+const PAYMENT_TYPE_INTENTS = {
+  PAYMENT_TYPE_MORTGAGE: {
+    label: 'Mortgage',
+    url: intentToActionUrl.MORTGAGE_PAYMENT,
+  },
+  PAYMENT_TYPE_CREDIT_CARD: {
+    label: 'Credit Card',
+    url: intentToActionUrl.CREDIT_CARD_PAYMENT,
+  },
+  PAYMENT_TYPE_AUTO_LOAN: {
+    label: 'Auto Loan',
+    url: intentToActionUrl.AUTO_LOAN_PAYMENT,
+  },
+  PAYMENT_TYPE_PERSONAL_LOAN: {
+    label: 'Personal Loan',
+    url: intentToActionUrl.LOAN_PAYMENT,
+  },
+}
+
+const LOAN_TYPE_INTENTS = {
+  LOAN_TYPE_PERSONAL: {
+    label: 'Personal Loan',
+    loanType: 'personal loan',
+    formId: '2000003',
+  },
+  LOAN_TYPE_AUTO: {
+    label: 'Auto Loan',
+    loanType: 'auto loan',
+    formId: '2000004',
+  },
+  LOAN_TYPE_HOME_EQUITY: {
+    label: 'Home Equity Loan',
+    loanType: 'home equity loan',
+    formId: '2000005',
+  },
+}
+
+const LOAN_COMPLETION_URL = intentToActionUrl.APPLY_LOAN
+const LOAN_BEGIN_INTENT = 'LOAN_BEGIN_APPLICATION'
+
+const sessionState = new Map()
+const mockMcpSessions = new Map()
+
+const loanTypeButtons = Object.entries(LOAN_TYPE_INTENTS).map(([intent, data]) => ({
+  label: data.label,
+  actionIntent: intent,
+}))
+
+const paymentTypeButtons = Object.entries(PAYMENT_TYPE_INTENTS).map(
+  ([intent, data]) => ({
+    label: data.label,
+    actionIntent: intent,
+  })
+)
+
+const getSessionKey = (req) => req.body?.sessionId || req.ip || 'anonymous'
+
+const buildChatResponse = ({
+  reply,
+  intent,
+  buttons = null,
+  button = null,
+  inputRequest = null,
+  loading = null,
+}) => ({
+  reply,
+  assistantMessage: reply,
+  intent,
+  buttons,
+  button,
+  inputRequest,
+  loading,
+})
+
+const buildMcpInputRequest = (field, sessionId, stepNumber, totalSteps) => ({
+  sessionId,
+  fieldId: field.fieldId,
+  placeholder: 'Enter your response',
+  inputType: field.inputType ?? 'text',
+  inputMode: field.inputType === 'number' ? 'numeric' : undefined,
+  stepNumber,
+  totalSteps,
+  prefillValue: field.value ?? '',
+  label: field.label,
+})
+
+const buildVerificationPrompt = (fieldLabel) => fieldLabel
+
+const buildLoanBeginMessage = () =>
+  "We'll prefill the information we have on file for you. Please verify the information is correct or update as necessary. If you're ready to start the application in our secure credit center, click below"
+
+const buildGeneralAnswer = async (message) => {
+  const systemContent = `
+You are a professional banking assistant.
+You may answer high-level, educational banking questions.
+Stay concise, neutral, and informational only.
+Do not provide links, application steps, or collect personal information.
+If asked about non-banking topics, politely decline and redirect to banking help.
+`.trim()
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.3,
+    messages: [
+      { role: 'system', content: systemContent },
+      { role: 'user', content: message },
+    ],
+  })
+
+  return response.choices?.[0]?.message?.content?.trim()
+}
+
+const detectIntent = async (message) => {
+  const systemContent = `
+You classify user intent for a banking assistant.
+Return ONLY valid JSON in this exact shape:
+{"intent":"loan_application|payment|general|out_of_scope","loanType":"personal loan|auto loan|home equity loan|null"}
+
+Rules:
+- "loan_application" if the user wants to apply for a loan.
+- "payment" if the user wants to make a payment.
+- "general" for banking education questions.
+- "out_of_scope" for non-banking topics.
+
+Loan type detection:
+- Set loanType if explicitly mentioned (personal, auto, home equity).
+- Otherwise use null.
+`.trim()
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0,
+    messages: [
+      { role: 'system', content: systemContent },
+      { role: 'user', content: message },
+    ],
+  })
+
+  const content = response.choices?.[0]?.message?.content?.trim() || '{}'
+  try {
+    const parsed = JSON.parse(content)
+    return {
+      intent: parsed.intent ?? 'general',
+      loanType: parsed.loanType ?? null,
+    }
+  } catch (error) {
+    return { intent: 'general', loanType: null }
+  }
+}
+
+const buildMockPrefillData = () => ({
+  firstName: 'Greg',
+  lastName: 'Wilwerding',
+  dateOfBirth: '1989-02-14',
+  ssnLast4: '1234',
+  addressLine1: '123 Market Street',
+  addressLine2: 'Suite 500',
+  city: 'San Francisco',
+  state: 'CA',
+  zip: '94105',
+  email: 'greg@callvu.com',
+  phone: '4155550123',
+})
+
+const callvuMcpMock = {
+  getFormDetails: ({ formId }) => {
+    const fields = [
+      { fieldId: 'firstName', label: 'First Name', inputType: 'text', required: true },
+      { fieldId: 'lastName', label: 'Last Name', inputType: 'text', required: true },
+      { fieldId: 'email', label: 'Email', inputType: 'text', required: true },
+      { fieldId: 'phone', label: 'Phone Number', inputType: 'text', required: true },
+      { fieldId: 'dateOfBirth', label: 'Date of Birth', inputType: 'date', required: true },
+      {
+        fieldId: 'ssnLast4',
+        label: 'Last 4 digits of SSN (soft check only)',
+        inputType: 'number',
+        required: true,
+      },
+      { fieldId: 'addressBlock', label: 'Address', inputType: 'text', required: true },
+      { fieldId: 'annualIncome', label: 'Annual Income', inputType: 'number', required: true },
+      { fieldId: 'loanAmount', label: 'Requested Loan Amount', inputType: 'number', required: true },
+    ]
+
+    return { formId, fields }
+  },
+  launchForm: ({ formId, metadata }) => ({
+    formId,
+    metadata,
+    status: 'launched',
+  }),
+  submitStep: ({ sessionId, fieldId, value }) => {
+    const session = mockMcpSessions.get(sessionId)
+    if (!session) return null
+    session.responses[fieldId] = value
+    const nextIndex = session.index + 1
+    if (nextIndex >= session.fields.length) {
+      mockMcpSessions.set(sessionId, session)
+      return { completed: true, responses: session.responses }
+    }
+    session.index = nextIndex
+    mockMcpSessions.set(sessionId, session)
+    return { completed: false, nextField: session.fields[nextIndex] }
+  },
+}
+
+const combineAddressFields = (fields) => {
+  const addressIds = new Set(['addressLine1', 'addressLine2', 'city', 'state', 'zip'])
+  const addressFields = fields.filter((field) => addressIds.has(field.fieldId))
+  if (addressFields.length === 0) return fields
+
+  const withoutAddress = fields.filter((field) => !addressIds.has(field.fieldId))
+  const addressField = {
+    fieldId: 'addressBlock',
+    label: 'Address',
+    inputType: 'text',
+    required: true,
+  }
+  const insertIndex = fields.findIndex((field) => addressIds.has(field.fieldId))
+  const safeIndex = insertIndex >= 0 ? insertIndex : withoutAddress.length
+  return [
+    ...withoutAddress.slice(0, safeIndex),
+    addressField,
+    ...withoutAddress.slice(safeIndex),
+  ]
+}
+
+const normalizeMcpFields = (rawFields = []) =>
+  combineAddressFields(
+    rawFields.map((field) => ({
+      fieldId: field.fieldId ?? field.id ?? field.name,
+      label: field.label ?? field.title ?? field.name ?? 'Field',
+      inputType: field.inputType ?? field.type ?? 'text',
+      required: Boolean(field.required),
+    }))
+  )
+
+const getCallvuMcpClient = () => createCallvuMcpClient(callvuConfig)
+
+const extractFieldsFromResponse = (response) => {
+  if (!response || typeof response !== 'object') return []
+  return (
+    response.fields ??
+    response.data?.fields ??
+    response.form?.fields ??
+    response.data?.form?.fields ??
+    response.payload?.fields ??
+    []
   )
 }
+
+const fetchFormDetails = async (formId) => {
+  if (!hasCallvuConfig) {
+    return callvuMcpMock.getFormDetails({ formId })
+  }
+
+  const payload = { formId: String(formId) }
+
+  try {
+    const client = getCallvuMcpClient()
+    const response = await client.getFormDetails(payload.formId, {
+      logPayload: true,
+      logResponse: true,
+    })
+    const rawFields = extractFieldsFromResponse(response)
+    const fields = normalizeMcpFields(rawFields)
+    if (fields.length > 0) {
+      return { formId, fields }
+    }
+    console.warn('Callvu MCP getFormDetails returned no fields.', {
+      formId,
+      keys: Object.keys(response ?? {}),
+    })
+  } catch (error) {
+    console.error('Callvu MCP getFormDetails rejected request:', error)
+    const status = Number(error?.status ?? 0)
+    if (!status || status >= 500) {
+      console.warn('Callvu MCP getFormDetails fallback to mock due to server error.')
+      return callvuMcpMock.getFormDetails({ formId })
+    }
+    throw error
+  }
+
+  return callvuMcpMock.getFormDetails({ formId })
+}
+
+const launchCallvuForm = async ({ formId, metadata }) => {
+  if (!hasCallvuConfig) {
+    return callvuMcpMock.launchForm({ formId, metadata })
+  }
+  try {
+    const client = getCallvuMcpClient()
+    return await client.callTool(
+      'LaunchForm',
+      { formId: String(formId), metadata },
+      { logPayload: false, logResponse: false }
+    )
+  } catch (error) {
+    try {
+      const client = getCallvuMcpClient()
+      return await client.request(`/orgs/${callvuConfig.orgId}/forms/${formId}/launch`, {
+        method: 'POST',
+        body: JSON.stringify({ metadata }),
+      })
+    } catch (restError) {
+      console.warn('Callvu MCP launchForm failed. Using mock result.', restError)
+      return callvuMcpMock.launchForm({ formId, metadata })
+    }
+  }
+}
+
+const createVerificationSession = async ({ formId }) => {
+  const sessionId = `mcp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  const { fields } = await fetchFormDetails(formId)
+  const prefill = buildMockPrefillData()
+  const addressParts = [
+    prefill.addressLine1,
+    prefill.addressLine2,
+    `${prefill.city}, ${prefill.state} ${prefill.zip}`,
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const hydratedFields = fields.map((field) => ({
+    ...field,
+    value:
+      field.fieldId === 'addressBlock'
+        ? addressParts
+        : prefill[field.fieldId] ?? '',
+  }))
+  mockMcpSessions.set(sessionId, {
+    formId,
+    fields: hydratedFields,
+    index: 0,
+    responses: {},
+  })
+  return { sessionId, fields: hydratedFields }
+}
+
+// Mock login endpoint (unchanged)
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body ?? {}
+  if (!username || !password)
+    return res.status(400).json({ message: 'Username and password are required.' })
+  if (username === 'demo' && password === 'password123')
+    return res.status(200).json({ message: 'Login successful. Welcome back!' })
+  return res.status(401).json({ message: 'Invalid credentials. Please try again.' })
+})
+
+app.post('/api/chat', async (req, res) => {
+  const { message, actionIntent, inputRequest } = req.body ?? {}
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ reply: 'Please provide a message to send.' })
+  }
+
+  try {
+    const sessionKey = getSessionKey(req)
+    const state = sessionState.get(sessionKey) ?? { flow: null }
+
+    if (state.flow === 'loan_verify' && inputRequest?.sessionId) {
+      const submitResponse = callvuMcpMock.submitStep({
+        sessionId: inputRequest.sessionId,
+        fieldId: inputRequest.fieldId,
+        value: message,
+      })
+
+      if (submitResponse?.completed) {
+        await launchCallvuForm({
+          formId: state.formId,
+          metadata: submitResponse.responses,
+        })
+        sessionState.delete(sessionKey)
+        const approvalMessage = `You’re approved for a ${state.loanType} with a limit of up to $20,000.`
+        const completionMessage =
+          'To complete your application, verify your identity and sign your loan documents using the secure link below.'
+        return res.json(
+          buildChatResponse({
+            reply: 'Checking eligibility…',
+            intent: 'LOAN_APPLICATION',
+            loading: {
+              durationMs: 4000,
+              approvalMessage,
+              completionMessage,
+              completionButton: {
+                label: 'Complete your application securely',
+                url: LOAN_COMPLETION_URL,
+                openInNewWindow: true,
+              },
+            },
+          })
+        )
+      }
+
+      if (submitResponse?.nextField) {
+        const nextStepNumber = Math.min(state.stepNumber + 1, state.totalSteps)
+        sessionState.set(sessionKey, {
+          ...state,
+          stepNumber: nextStepNumber,
+        })
+        return res.json(
+          buildChatResponse({
+            reply: buildVerificationPrompt(submitResponse.nextField.label),
+            intent: 'LOAN_APPLICATION',
+            inputRequest: buildMcpInputRequest(
+              submitResponse.nextField,
+              inputRequest.sessionId,
+              nextStepNumber,
+              state.totalSteps
+            ),
+          })
+        )
+      }
+    }
+
+    if (state.flow === 'loan_begin') {
+      if (actionIntent === LOAN_BEGIN_INTENT) {
+        try {
+          const sessionStart = await createVerificationSession({
+            formId: state.formId,
+          })
+          const firstField = sessionStart.fields[0]
+          const totalSteps = sessionStart.fields.length
+          sessionState.set(sessionKey, {
+            flow: 'loan_verify',
+            loanType: state.loanType,
+            formId: state.formId,
+            mcpSessionId: sessionStart.sessionId,
+            stepNumber: 1,
+            totalSteps,
+          })
+          return res.json(
+            buildChatResponse({
+              reply: buildVerificationPrompt(firstField.label),
+              intent: 'LOAN_APPLICATION',
+              inputRequest: buildMcpInputRequest(
+                firstField,
+                sessionStart.sessionId,
+                1,
+                totalSteps
+              ),
+            })
+          )
+        } catch (error) {
+          console.error('Unable to start Callvu MCP loan verification.', error)
+          return res.status(500).json(
+            buildChatResponse({
+              reply:
+                'We were unable to load the loan application fields from Callvu. Please try again shortly.',
+              intent: 'LOAN_APPLICATION',
+            })
+          )
+        }
+      }
+
+      return res.json(
+        buildChatResponse({
+          reply: buildLoanBeginMessage(),
+          intent: 'LOAN_APPLICATION',
+          buttons: [{ label: 'Begin Application', actionIntent: LOAN_BEGIN_INTENT }],
+        })
+      )
+    }
+
+    if (state.flow === 'payment_type') {
+      if (PAYMENT_TYPE_INTENTS[actionIntent]) {
+        sessionState.delete(sessionKey)
+        return res.json(
+          buildChatResponse({
+            reply:
+              'Sure I can help with that. Click the link below to make your payment in our Secure Payment Portal.',
+            intent: 'PAYMENT',
+            button: {
+              label: 'Secure Payment Center',
+              url: PAYMENT_TYPE_INTENTS[actionIntent].url,
+              openInNewWindow: true,
+            },
+          })
+        )
+      }
+
+      return res.json(
+        buildChatResponse({
+          reply: 'Which account would you like to make a payment on?',
+          intent: 'PAYMENT',
+          buttons: paymentTypeButtons,
+        })
+      )
+    }
+
+    if (state.flow === 'loan_type') {
+      if (LOAN_TYPE_INTENTS[actionIntent]) {
+        sessionState.set(sessionKey, {
+          flow: 'loan_begin',
+          loanType: LOAN_TYPE_INTENTS[actionIntent].loanType,
+          formId: LOAN_TYPE_INTENTS[actionIntent].formId,
+        })
+        return res.json(
+          buildChatResponse({
+            reply: buildLoanBeginMessage(),
+            intent: 'LOAN_APPLICATION',
+            buttons: [{ label: 'Begin Application', actionIntent: LOAN_BEGIN_INTENT }],
+          })
+        )
+      }
+
+      return res.json(
+        buildChatResponse({
+          reply: 'What type of loan are you interested in?',
+          intent: 'LOAN_APPLICATION',
+          buttons: loanTypeButtons,
+        })
+      )
+    }
+
+    if (PAYMENT_TYPE_INTENTS[actionIntent]) {
+      return res.json(
+        buildChatResponse({
+          reply:
+            'Sure I can help with that. Click the link below to make your payment in our Secure Payment Portal.',
+          intent: 'PAYMENT',
+          button: {
+            label: 'Secure Payment Center',
+            url: PAYMENT_TYPE_INTENTS[actionIntent].url,
+            openInNewWindow: true,
+          },
+        })
+      )
+    }
+
+      if (LOAN_TYPE_INTENTS[actionIntent]) {
+        sessionState.set(sessionKey, {
+          flow: 'loan_begin',
+          loanType: LOAN_TYPE_INTENTS[actionIntent].loanType,
+          formId: LOAN_TYPE_INTENTS[actionIntent].formId,
+        })
+        return res.json(
+          buildChatResponse({
+            reply: buildLoanBeginMessage(),
+            intent: 'LOAN_APPLICATION',
+            buttons: [{ label: 'Begin Application', actionIntent: LOAN_BEGIN_INTENT }],
+          })
+        )
+      }
+
+    const intentResult = await detectIntent(message)
+
+    if (intentResult.intent === 'payment') {
+      sessionState.set(sessionKey, { flow: 'payment_type' })
+      return res.json(
+        buildChatResponse({
+          reply: 'Which account would you like to make a payment on?',
+          intent: 'PAYMENT',
+          buttons: paymentTypeButtons,
+        })
+      )
+    }
+
+    if (intentResult.intent === 'loan_application') {
+      if (intentResult.loanType) {
+        const match = Object.values(LOAN_TYPE_INTENTS).find(
+          (entry) => entry.loanType === intentResult.loanType
+        )
+        if (match) {
+          sessionState.set(sessionKey, {
+            flow: 'loan_begin',
+            loanType: match.loanType,
+            formId: match.formId,
+          })
+          return res.json(
+            buildChatResponse({
+              reply: buildLoanBeginMessage(),
+              intent: 'LOAN_APPLICATION',
+              buttons: [{ label: 'Begin Application', actionIntent: LOAN_BEGIN_INTENT }],
+            })
+          )
+        }
+      }
+
+      sessionState.set(sessionKey, { flow: 'loan_type' })
+      return res.json(
+        buildChatResponse({
+          reply: 'What type of loan are you interested in?',
+          intent: 'LOAN_APPLICATION',
+          buttons: loanTypeButtons,
+        })
+      )
+    }
+
+    if (intentResult.intent === 'out_of_scope') {
+      return res.json(
+        buildChatResponse({
+          reply:
+            'I can only help with banking-related questions like payments or loan applications.',
+          intent: 'OUT_OF_SCOPE',
+        })
+      )
+    }
+
+    const response = await buildGeneralAnswer(message)
+    return res.json(
+      buildChatResponse({
+        reply:
+          response ||
+          'I can help with payments, loan applications, or general banking questions. How can I help?',
+        intent: 'GENERAL_BANKING_QUESTION',
+      })
+    )
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({
+      reply:
+        'Sorry, I could not get a response from the assistant. Please try again.',
+    })
+  }
+})
+
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`)
+})
+/* LEGACY BLOCK START
+import OpenAI from 'openai'
+import express from 'express'
+import cors from 'cors'
+import dotenv from 'dotenv'
+import { intentToActionUrl } from './intentToActionUrl.js'
+
+dotenv.config()
+
+const app = express()
+const PORT = process.env.PORT || 3001
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+app.use(cors())
+app.use(express.json())
+
+const PAYMENT_TYPE_INTENTS = {
+  PAYMENT_TYPE_MORTGAGE: intentToActionUrl.MORTGAGE_PAYMENT,
+  PAYMENT_TYPE_CREDIT_CARD: intentToActionUrl.CREDIT_CARD_PAYMENT,
+  PAYMENT_TYPE_AUTO_LOAN: intentToActionUrl.AUTO_LOAN_PAYMENT,
+  PAYMENT_TYPE_PERSONAL_LOAN: intentToActionUrl.LOAN_PAYMENT,
+}
+
+const LOAN_TYPE_INTENTS = {
+  LOAN_TYPE_PERSONAL: 'personal loan',
+  LOAN_TYPE_AUTO: 'auto loan',
+  LOAN_TYPE_HOME_EQUITY: 'home equity loan',
+}
+
+const LOAN_COMPLETION_URL = intentToActionUrl.APPLY_LOAN
+
+const sessionState = new Map()
+const mockMcpSessions = new Map()
+
+const buildMockLoanSteps = () => [
+  { fieldId: 'firstName', prompt: 'First Name', inputType: 'text' },
+  { fieldId: 'lastName', prompt: 'Last Name', inputType: 'text' },
+  { fieldId: 'dateOfBirth', prompt: 'Date of Birth', inputType: 'date' },
+  {
+    fieldId: 'ssnLast4',
+    prompt: 'Last 4 digits of SSN (soft check only)',
+    inputType: 'number',
+  },
+  { fieldId: 'addressLine1', prompt: 'Street Address', inputType: 'text' },
+  { fieldId: 'city', prompt: 'City', inputType: 'text' },
+  { fieldId: 'state', prompt: 'State', inputType: 'text' },
+  { fieldId: 'zip', prompt: 'ZIP Code', inputType: 'number' },
+  { fieldId: 'annualIncome', prompt: 'Annual Income', inputType: 'number' },
+  { fieldId: 'loanAmount', prompt: 'Requested Loan Amount', inputType: 'number' },
+]
+
+const callvuMcpMock = {
+  startSession: ({ flowType }) => {
+    const sessionId = `mcp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const steps = flowType === 'loan_application' ? buildMockLoanSteps() : []
+    mockMcpSessions.set(sessionId, { steps, index: 0 })
+    return { sessionId, nextStep: steps[0] }
+  },
+  submitStep: ({ sessionId }) => {
+    const session = mockMcpSessions.get(sessionId)
+    if (!session) return null
+    const nextIndex = session.index + 1
+    if (nextIndex >= session.steps.length) {
+      mockMcpSessions.delete(sessionId)
+      return { completed: true }
+    }
+    session.index = nextIndex
+    mockMcpSessions.set(sessionId, session)
+    return { completed: false, nextStep: session.steps[nextIndex] }
+  },
+}
+
+const getSessionKey = (req) => req.body?.sessionId || req.ip || 'anonymous'
+
+const isPaymentIntent = (text) => {
+  const msg = text.toLowerCase()
+  return (
+    msg.includes('payment') ||
+    msg.includes('pay my bill') ||
+    msg.includes('make a payment')
+  )
+}
+
+const isLoanApplyIntent = (text) => {
+  const msg = text.toLowerCase()
+  return msg.includes('apply') && msg.includes('loan')
+}
+
+const buildMcpInputRequest = (nextStep, sessionId, stepNumber, totalSteps) => ({
+  sessionId,
+  fieldId: nextStep.fieldId,
+  placeholder: 'Enter your response',
+  inputType: nextStep.inputType ?? 'text',
+  inputMode: nextStep.inputType === 'number' ? 'numeric' : undefined,
+  stepNumber,
+  totalSteps,
+})
+
+const buildChatResponse = ({
+  reply,
+  intent,
+  buttons = null,
+  button = null,
+  inputRequest = null,
+  loading = null,
+}) => ({
+  reply,
+  assistantMessage: reply,
+  intent,
+  buttons,
+  button,
+  inputRequest,
+  loading,
+})
+
+const paymentTypeButtons = [
+  { label: 'Mortgage', actionIntent: 'PAYMENT_TYPE_MORTGAGE' },
+  { label: 'Credit Card', actionIntent: 'PAYMENT_TYPE_CREDIT_CARD' },
+  { label: 'Auto Loan', actionIntent: 'PAYMENT_TYPE_AUTO_LOAN' },
+  { label: 'Personal Loan', actionIntent: 'PAYMENT_TYPE_PERSONAL_LOAN' },
+]
+
+const loanTypeButtons = [
+  { label: 'Personal Loan', actionIntent: 'LOAN_TYPE_PERSONAL' },
+  { label: 'Auto Loan', actionIntent: 'LOAN_TYPE_AUTO' },
+  { label: 'Home Equity Loan', actionIntent: 'LOAN_TYPE_HOME_EQUITY' },
+]
+
+const buildGeneralAnswer = async (message) => {
+  const systemContent = `
+You are a professional banking assistant.
+You may answer high-level, educational banking questions.
+Stay concise, neutral, and informational only.
+Do not provide links, application steps, or collect personal information.
+If asked about non-banking topics, politely decline and redirect to banking help.
+`.trim()
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.3,
+    messages: [
+      { role: 'system', content: systemContent },
+      { role: 'user', content: message },
+    ],
+  })
+
+  return response.choices?.[0]?.message?.content?.trim()
+}
+
+// Mock login endpoint (unchanged)
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body ?? {}
+  if (!username || !password)
+    return res.status(400).json({ message: 'Username and password are required.' })
+  if (username === 'demo' && password === 'password123')
+    return res.status(200).json({ message: 'Login successful. Welcome back!' })
+  return res.status(401).json({ message: 'Invalid credentials. Please try again.' })
+})
+
+app.post('/api/chat', async (req, res) => {
+  const { message, actionIntent, inputRequest } = req.body ?? {}
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ reply: 'Please provide a message to send.' })
+  }
+
+  try {
+    const sessionKey = getSessionKey(req)
+    const state = sessionState.get(sessionKey) ?? { flow: null }
+
+    if (state.flow === 'loan_mcp' && inputRequest?.sessionId) {
+      const submitResponse = callvuMcpMock.submitStep({
+        sessionId: inputRequest.sessionId,
+        fieldId: inputRequest.fieldId,
+        value: message,
+      })
+
+      if (submitResponse?.completed) {
+        sessionState.delete(sessionKey)
+        const approvalMessage = `You’re approved for a ${state.loanType} with a limit of up to $20,000.`
+        const completionMessage =
+          'To complete your application, verify your identity and sign your loan documents using the secure link below.'
+        return res.json(
+          buildChatResponse({
+            reply: 'Checking eligibility…',
+            intent: 'LOAN_APPLICATION',
+            loading: {
+              durationMs: 4000,
+              approvalMessage,
+              completionMessage,
+              completionButton: {
+                label: 'Complete Application',
+                url: LOAN_COMPLETION_URL,
+                openInNewWindow: true,
+              },
+            },
+          })
+        )
+      }
+
+      if (submitResponse?.nextStep) {
+        const nextStepNumber = Math.min(state.stepNumber + 1, state.totalSteps)
+        sessionState.set(sessionKey, {
+          ...state,
+          stepNumber: nextStepNumber,
+        })
+        return res.json(
+          buildChatResponse({
+            reply: submitResponse.nextStep.prompt,
+            intent: 'LOAN_APPLICATION',
+            inputRequest: buildMcpInputRequest(
+              submitResponse.nextStep,
+              inputRequest.sessionId,
+              nextStepNumber,
+              state.totalSteps
+            ),
+          })
+        )
+      }
+    }
+
+    if (state.flow === 'payment_await_type') {
+      if (PAYMENT_TYPE_INTENTS[actionIntent]) {
+        sessionState.delete(sessionKey)
+        return res.json(
+          buildChatResponse({
+            reply:
+              'Great, click the link below to make your payment in our secure payment portal.',
+            intent: 'PAYMENT',
+            button: {
+              label: 'Secure Payment Center',
+              url: PAYMENT_TYPE_INTENTS[actionIntent],
+              openInNewWindow: true,
+            },
+          })
+        )
+      }
+
+      return res.json(
+        buildChatResponse({
+          reply: 'Which account would you like to make a payment on?',
+          intent: 'PAYMENT',
+          buttons: paymentTypeButtons,
+        })
+      )
+    }
+
+    if (state.flow === 'loan_await_type') {
+      if (LOAN_TYPE_INTENTS[actionIntent]) {
+        const sessionStart = callvuMcpMock.startSession({ flowType: 'loan_application' })
+        const totalSteps = buildMockLoanSteps().length
+        sessionState.set(sessionKey, {
+          flow: 'loan_mcp',
+          loanType: LOAN_TYPE_INTENTS[actionIntent],
+          mcpSessionId: sessionStart.sessionId,
+          stepNumber: 1,
+          totalSteps,
+        })
+        return res.json(
+          buildChatResponse({
+            reply: sessionStart.nextStep.prompt,
+            intent: 'LOAN_APPLICATION',
+            inputRequest: buildMcpInputRequest(
+              sessionStart.nextStep,
+              sessionStart.sessionId,
+              1,
+              totalSteps
+            ),
+          })
+        )
+      }
+
+      return res.json(
+        buildChatResponse({
+          reply: 'What type of loan are you interested in?',
+          intent: 'LOAN_APPLICATION',
+          buttons: loanTypeButtons,
+        })
+      )
+    }
+
+    if (PAYMENT_TYPE_INTENTS[actionIntent]) {
+      return res.json(
+        buildChatResponse({
+          reply:
+            'Great, click the link below to make your payment in our secure payment portal.',
+          intent: 'PAYMENT',
+          button: {
+            label: 'Secure Payment Center',
+            url: PAYMENT_TYPE_INTENTS[actionIntent],
+            openInNewWindow: true,
+          },
+        })
+      )
+    }
+
+    if (LOAN_TYPE_INTENTS[actionIntent]) {
+      const sessionStart = callvuMcpMock.startSession({ flowType: 'loan_application' })
+      const totalSteps = buildMockLoanSteps().length
+      sessionState.set(sessionKey, {
+        flow: 'loan_mcp',
+        loanType: LOAN_TYPE_INTENTS[actionIntent],
+        mcpSessionId: sessionStart.sessionId,
+        stepNumber: 1,
+        totalSteps,
+      })
+      return res.json(
+        buildChatResponse({
+          reply: sessionStart.nextStep.prompt,
+          intent: 'LOAN_APPLICATION',
+          inputRequest: buildMcpInputRequest(
+            sessionStart.nextStep,
+            sessionStart.sessionId,
+            1,
+            totalSteps
+          ),
+        })
+      )
+    }
+
+    if (isPaymentIntent(message)) {
+      sessionState.set(sessionKey, { flow: 'payment_await_type' })
+      return res.json(
+        buildChatResponse({
+          reply: 'Which account would you like to make a payment on?',
+          intent: 'PAYMENT',
+          buttons: paymentTypeButtons,
+        })
+      )
+    }
+
+    if (isLoanApplyIntent(message)) {
+      sessionState.set(sessionKey, { flow: 'loan_await_type' })
+      return res.json(
+        buildChatResponse({
+          reply: 'What type of loan are you interested in?',
+          intent: 'LOAN_APPLICATION',
+          buttons: loanTypeButtons,
+        })
+      )
+    }
+
+    const response = await buildGeneralAnswer(message)
+    return res.json(
+      buildChatResponse({
+        reply:
+          response ||
+          'I can help with payments, loan applications, or general banking questions. How can I help?',
+        intent: 'GENERAL_BANKING_QUESTION',
+      })
+    )
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({
+      reply:
+        'Sorry, I could not get a response from the assistant. Please try again.',
+    })
+  }
+})
+
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`)
+})
+import OpenAI from 'openai'
+import express from 'express'
+import cors from 'cors'
+import dotenv from 'dotenv'
+import { intentToActionUrl } from './intentToActionUrl.js'
+
+dotenv.config()
+
+const app = express()
+const PORT = process.env.PORT || 3001
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
 app.use(cors())
 app.use(express.json())
@@ -91,6 +1071,7 @@ const buildChatResponse = ({
   buttons = null,
   actionUrl = null,
   buttonText = null,
+  buttonOptions = null,
   entities = null,
   inputRequest = null,
   loading = null,
@@ -118,7 +1099,8 @@ const buildChatResponse = ({
       ? {
           label: buttonText ?? 'Open Form',
           url: actionUrl,
-          openInNewWindow: true,
+          openInNewWindow: buttonOptions?.openInNewWindow ?? true,
+          embedInChat: buttonOptions?.embedInChat ?? false,
         }
       : null,
     buttons,
@@ -161,6 +1143,109 @@ const intentButtonText = {
 
 const getToolDefinition = (toolName) =>
   callvuToolRegistry.tools.find((tool) => tool.name === toolName)
+
+const loanEligibilityByType = {
+  personal: 20000,
+  credit_card: 10000,
+  auto: 30000,
+}
+
+const loanTypeLabel = {
+  personal: 'personal',
+  credit_card: 'credit card',
+  auto: 'auto',
+}
+
+const mockMcpSessions = new Map()
+
+const buildMockLoanSteps = () => [
+  {
+    fieldId: 'firstName',
+    prompt: 'First Name',
+    inputType: 'text',
+    validation: { required: true },
+  },
+  {
+    fieldId: 'lastName',
+    prompt: 'Last Name',
+    inputType: 'text',
+    validation: { required: true },
+  },
+  {
+    fieldId: 'dateOfBirth',
+    prompt: 'Date of Birth',
+    inputType: 'date',
+    validation: { required: true },
+  },
+  {
+    fieldId: 'ssnLast4',
+    prompt: 'Last 4 digits of SSN (soft check only)',
+    inputType: 'number',
+    validation: { required: true, minLength: 4, maxLength: 4 },
+  },
+  {
+    fieldId: 'addressLine1',
+    prompt: 'Street Address',
+    inputType: 'text',
+    validation: { required: true },
+  },
+  {
+    fieldId: 'city',
+    prompt: 'City',
+    inputType: 'text',
+    validation: { required: true },
+  },
+  {
+    fieldId: 'state',
+    prompt: 'State',
+    inputType: 'text',
+    validation: { required: true },
+  },
+  {
+    fieldId: 'zip',
+    prompt: 'ZIP Code',
+    inputType: 'number',
+    validation: { required: true },
+  },
+  {
+    fieldId: 'annualIncome',
+    prompt: 'Annual Income',
+    inputType: 'number',
+    validation: { required: true },
+  },
+  {
+    fieldId: 'loanAmount',
+    prompt: 'Requested Loan Amount',
+    inputType: 'number',
+    validation: { required: true },
+  },
+]
+
+const callvuMcpMock = {
+  startSession: ({ flowType }) => {
+    const sessionId = `mcp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const steps = flowType === 'loan_application' ? buildMockLoanSteps() : []
+    const loanType = 'personal'
+    mockMcpSessions.set(sessionId, { flowType, loanType, steps, index: 0 })
+    return { sessionId, nextStep: steps[0] }
+  },
+  submitStep: ({ sessionId }) => {
+    const session = mockMcpSessions.get(sessionId)
+    if (!session) {
+      return null
+    }
+    const nextIndex = session.index + 1
+    if (nextIndex >= session.steps.length) {
+      mockMcpSessions.delete(sessionId)
+      return {
+        completed: true,
+      }
+    }
+    session.index = nextIndex
+    mockMcpSessions.set(sessionId, session)
+    return { completed: false, nextStep: session.steps[nextIndex] }
+  },
+}
 
 const validateToolArguments = (toolDefinition, args) => {
   if (!toolDefinition) return { isValid: false, error: 'Unknown tool.' }
@@ -269,7 +1354,7 @@ const isGenericPaymentRequest = (text) => {
 }
 
 const buildPaymentChoiceResponse = () => ({
-  reply: 'Sure — what type of account would you like to make a payment on?',
+reply: 'Which account would you like to make a payment on?',
   intent: 'GENERAL_BANKING_QUESTION',
   buttons: [
     { label: 'Mortgage', actionIntent: 'MORTGAGE_PAYMENT' },
@@ -343,21 +1428,30 @@ const creditCardFeatureIntents = [
 ]
 const loanTypeIntents = ['LOAN_TYPE_PERSONAL', 'LOAN_TYPE_CREDIT_CARD', 'LOAN_TYPE_AUTO']
 const disputeAnswerIntents = ['DISPUTE_LOST_STOLEN', 'DISPUTE_WRONG_AMOUNT']
+const loanApplicationStartIntent = 'START_LOAN_APPLICATION'
 
-const loanEligibilityByType = {
-  LOAN_TYPE_PERSONAL: {
-    label: 'Personal Loan',
-    approval: 'You’re approved for up to $20,000',
-  },
-  LOAN_TYPE_CREDIT_CARD: {
-    label: 'Credit Card',
-    approval: 'You’re approved for up to $10,000',
-  },
-  LOAN_TYPE_AUTO: {
-    label: 'Auto Loan',
-    approval: 'You’re approved for up to $30,000',
-  },
+const loanTypeByIntent = {
+  LOAN_TYPE_PERSONAL: 'personal',
+  LOAN_TYPE_CREDIT_CARD: 'credit_card',
+  LOAN_TYPE_AUTO: 'auto',
 }
+
+const buildMcpInputRequest = (nextStep, sessionId, stepNumber, totalSteps) => {
+  if (!nextStep) return null
+  return {
+    sessionId,
+    fieldId: nextStep.fieldId,
+    placeholder: 'Enter your response',
+    inputType: nextStep.inputType ?? 'text',
+    inputMode: nextStep.inputType === 'number' ? 'numeric' : undefined,
+    maxLength: nextStep.validation?.maxLength,
+    stepNumber,
+    totalSteps,
+    helperText:
+      stepNumber && totalSteps ? `Step ${stepNumber} of ${totalSteps}` : null,
+  }
+}
+
 
 const intentHandlers = {
   CHECK_LOAN_PAYMENT: ({ user }) => ({
@@ -510,7 +1604,7 @@ app.post('/api/login', (req, res) => {
 
 // OpenAI-backed /api/chat endpoint
 app.post('/api/chat', async (req, res) => {
-  const { message, user, actionIntent } = req.body ?? {}
+  const { message, user, actionIntent, inputRequest } = req.body ?? {}
   if (!message || typeof message !== 'string') {
     return res.status(400).json({ reply: 'Please provide a message to send.' })
   }
@@ -524,7 +1618,8 @@ app.post('/api/chat', async (req, res) => {
       creditCardIntentIntents.includes(actionIntent) ||
       creditCardTypeIntents.includes(actionIntent) ||
       creditCardFeatureIntents.includes(actionIntent)
-    const isLoanAction = loanTypeIntents.includes(actionIntent)
+    const isLoanAction =
+      loanTypeIntents.includes(actionIntent) || actionIntent === loanApplicationStartIntent
     const isDisputeAction = disputeAnswerIntents.includes(actionIntent)
     const shouldHandleCreditCard = !isLoanAction
 
@@ -551,6 +1646,54 @@ app.post('/api/chat', async (req, res) => {
       creditCardFlowBySession.delete(sessionKey)
       loanApplicationFlowBySession.delete(sessionKey)
       disputeFlowBySession.delete(sessionKey)
+    }
+
+    const activeLoanFlow = loanApplicationFlowBySession.get(sessionKey)
+    const incomingInputRequest = inputRequest ?? null
+
+    if (activeLoanFlow?.step === 'mcp' && incomingInputRequest?.sessionId) {
+      const submitResponse = callvuMcpMock.submitStep({
+        sessionId: incomingInputRequest.sessionId,
+        fieldId: incomingInputRequest.fieldId,
+        value: message,
+      })
+      if (submitResponse?.completed) {
+        loanApplicationFlowBySession.delete(sessionKey)
+        const resolvedLoanType = loanTypeLabel[activeLoanFlow.loanType] ?? 'personal'
+        const limit = loanEligibilityByType[activeLoanFlow.loanType] ?? 20000
+        return res.json(
+          buildResponse({
+            reply: `You’re pre-approved for a ${resolvedLoanType} loan up to $${limit}.`,
+            intent: 'APPLY_LOAN',
+          })
+        )
+      }
+      if (submitResponse?.nextStep) {
+        const nextStepNumber = Math.min(
+          (activeLoanFlow.stepNumber ?? 1) + 1,
+          activeLoanFlow.totalSteps ?? 10
+        )
+        loanApplicationFlowBySession.set(sessionKey, {
+          step: 'mcp',
+          sessionId: incomingInputRequest.sessionId,
+          loanType: activeLoanFlow.loanType,
+          fieldId: submitResponse.nextStep.fieldId,
+          stepNumber: nextStepNumber,
+          totalSteps: activeLoanFlow.totalSteps,
+        })
+        return res.json(
+          buildResponse({
+            reply: submitResponse.nextStep.prompt,
+            intent: 'APPLY_LOAN',
+            inputRequest: buildMcpInputRequest(
+              submitResponse.nextStep,
+              incomingInputRequest.sessionId,
+              nextStepNumber,
+              activeLoanFlow.totalSteps
+            ),
+          })
+        )
+      }
     }
 
     // Payment flow: ask type, then launch on selection.
@@ -759,7 +1902,7 @@ app.post('/api/chat', async (req, res) => {
       )
     }
 
-    // Loan application flow: type -> inputs -> eligibility.
+    // Loan application flow: type -> MCP stepwise prompts.
     if (isLoanApplyRequest(message)) {
       loanApplicationFlowBySession.set(sessionKey, { step: 'await_type' })
       const typeResponse = buildLoanApplicationTypeResponse()
@@ -773,87 +1916,72 @@ app.post('/api/chat', async (req, res) => {
     }
 
     if (loanTypeIntents.includes(actionIntent)) {
+      const loanType = loanTypeByIntent[actionIntent] ?? 'personal'
       loanApplicationFlowBySession.set(sessionKey, {
-        step: 'await_name',
-        loanType: actionIntent,
-        answers: {},
+        step: 'await_start',
+        loanType,
       })
       return res.json(
         buildResponse({
-          reply: 'What is your full name?',
+          reply:
+            'We can start your application using our secure integration to the form.',
           intent: 'APPLY_LOAN',
-          inputRequest: {
-            id: 'loan_full_name',
-            inputMode: 'text',
-            placeholder: 'Full name',
-            mask: false,
-            helperText: null,
-          },
+          buttons: [{ label: 'Start Application', actionIntent: loanApplicationStartIntent }],
           entities: { loanType: actionIntent },
         })
       )
     }
 
-    const activeLoanFlow = loanApplicationFlowBySession.get(sessionKey)
-    if (activeLoanFlow) {
-      if (activeLoanFlow.step === 'await_name') {
-        activeLoanFlow.answers.fullName = message.trim()
-        activeLoanFlow.step = 'await_dob'
-        loanApplicationFlowBySession.set(sessionKey, activeLoanFlow)
-        return res.json(
-          buildResponse({
-            reply: 'What is your date of birth?',
-            intent: 'APPLY_LOAN',
-            inputRequest: {
-              id: 'loan_dob',
-              inputMode: 'text',
-              placeholder: 'MM/DD/YYYY',
-              mask: false,
-              helperText: null,
-            },
-            entities: { loanType: activeLoanFlow.loanType },
-          })
-        )
-      }
+    if (actionIntent === loanApplicationStartIntent) {
+      const pendingLoanFlow = loanApplicationFlowBySession.get(sessionKey)
+      const loanType = pendingLoanFlow?.loanType ?? 'personal'
+      const sessionStart = callvuMcpMock.startSession({
+        flowType: 'loan_application',
+      })
+      const totalSteps = buildMockLoanSteps().length
+      loanApplicationFlowBySession.set(sessionKey, {
+        step: 'mcp',
+        sessionId: sessionStart.sessionId,
+        loanType,
+        fieldId: sessionStart.nextStep?.fieldId ?? null,
+        stepNumber: 1,
+        totalSteps,
+      })
+      return res.json(
+        buildResponse({
+          reply: sessionStart.nextStep?.prompt ?? 'Let’s get started.',
+          intent: 'APPLY_LOAN',
+          inputRequest: buildMcpInputRequest(
+            sessionStart.nextStep,
+            sessionStart.sessionId,
+            1,
+            totalSteps
+          ),
+          entities: { loanType },
+        })
+      )
+    }
 
-      if (activeLoanFlow.step === 'await_dob') {
-        activeLoanFlow.answers.dob = message.trim()
-        activeLoanFlow.step = 'await_ssn_last4'
-        loanApplicationFlowBySession.set(sessionKey, activeLoanFlow)
-        return res.json(
-          buildResponse({
-            reply: 'Please enter the last 4 digits of your SSN (soft check only)',
-            intent: 'APPLY_LOAN',
-            inputRequest: {
-              id: 'loan_ssn_last4',
-              inputMode: 'numeric',
-              placeholder: 'Last 4 digits',
-              mask: true,
-              helperText: 'This is a simulated soft check. Do not enter your full SSN.',
-              maxLength: 4,
-            },
-            entities: { loanType: activeLoanFlow.loanType },
-          })
-        )
-      }
+    if (activeLoanFlow?.step === 'await_type') {
+      const typeResponse = buildLoanApplicationTypeResponse()
+      return res.json(
+        buildResponse({
+          reply: typeResponse.reply,
+          intent: typeResponse.intent,
+          buttons: typeResponse.buttons,
+        })
+      )
+    }
 
-      if (activeLoanFlow.step === 'await_ssn_last4') {
-        const last4 = message.replace(/\D/g, '').slice(0, 4)
-        const loanType = activeLoanFlow.loanType
-        const approval = loanEligibilityByType[loanType]
-        loanApplicationFlowBySession.delete(sessionKey)
-        return res.json(
-          buildResponse({
-            reply: 'Checking eligibility',
-            intent: 'APPLY_LOAN',
-            loading: {
-              durationMs: 5000,
-              approvalMessage: `Simulated approval for ${approval.label}: ${approval.approval}.`,
-            },
-            entities: { loanType, last4 },
-          })
-        )
-      }
+    if (activeLoanFlow?.step === 'await_start') {
+      return res.json(
+        buildResponse({
+          reply:
+            'We can start your application using our secure integration to the form.',
+          intent: 'APPLY_LOAN',
+          buttons: [{ label: 'Start Application', actionIntent: loanApplicationStartIntent }],
+        })
+      )
     }
 
     // Dispute flow: lost/stolen vs wrong amount -> launch.
@@ -948,7 +2076,7 @@ Routing rules:
 - End with a confident handoff to the secure Callvu form
 - If credit card intent is unclear, ask whether the user wants to make a payment or apply
 - For credit card applications, ask about desired benefits (rewards, airline miles, intro APR) and never ask about annual fees or rate details
-- For loan applications, collect loan type, full name, date of birth, and last 4 of SSN for a simulated soft check only
+- For loan applications, ask for loan type using buttons, then only relay MCP prompts one step at a time
 
 Scope:
 - Banking topics only
@@ -965,7 +2093,7 @@ Below are example interactions that demonstrate the desired flow.
 
 Example 1 – Payment (unspecified)
 User: I want to make a payment.
-Assistant: Sure — what type of account would you like to make a payment on?
+Assistant: Which account would you like to make a payment on?
 Buttons: Mortgage | Credit Card | Auto Loan | Personal Loan
 User selects: Personal Loan
 Assistant: Got it. I’ll take you to our secure loan payment center.
@@ -988,10 +2116,17 @@ User: I’d like to apply for a loan.
 Assistant: What type of loan would you like to apply for?
 Buttons: Personal Loan | Credit Card | Auto Loan
 User selects: Auto Loan
-Assistant: What is your full name?
-Assistant: What is your date of birth?
-Assistant: Please enter the last 4 digits of your SSN (soft check only)
-Assistant: Simulated approval for Auto Loan: You’re approved for up to $30,000.
+Assistant: First Name
+Assistant: Last Name
+Assistant: Date of Birth
+Assistant: Last 4 digits of SSN (soft check only)
+Assistant: Street Address
+Assistant: City
+Assistant: State
+Assistant: ZIP Code
+Assistant: Annual Income
+Assistant: Requested Loan Amount
+Assistant: You’re pre-approved for an auto loan up to $30,000.
 
 Example 5 – Dispute a charge
 User: I need to dispute a charge.
@@ -1183,3 +2318,4 @@ userContext: ${JSON.stringify(userContext)}`.trim(),
 app.listen(PORT, () => {
   console.log(`Mock API running on http://localhost:${PORT}`)
 })
+*/

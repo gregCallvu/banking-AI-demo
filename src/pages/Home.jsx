@@ -47,6 +47,7 @@ function ChatPanel({
   inputMode,
   inputMaxLength,
   isInputLocked,
+  isMcpActive,
 }) {
   const endRef = useRef(null)
 
@@ -80,7 +81,10 @@ function ChatPanel({
       </div>
 
       <div className="flex-1 space-y-3 overflow-y-auto bg-white px-4 py-4">
-        {messages.map((message) => (
+        {messages.map((message, index) => {
+          const isActivePrompt =
+            message.isMcpPrompt && index === messages.length - 1
+          return (
           <div
             key={message.id}
             className={`flex ${
@@ -91,10 +95,45 @@ function ChatPanel({
               className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm shadow-sm ${
                 message.role === 'user'
                   ? 'bg-slate-200 text-finova-text'
-                  : 'bg-slate-100 text-finova-text'
+                  : 'bg-[#97B9F4] text-finova-text'
               }`}
             >
               {message.text}
+              {isActivePrompt && (
+                <form className="mt-3 space-y-2" onSubmit={onSend}>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type={inputType ?? 'text'}
+                      value={input}
+                      onChange={onInputChange}
+                      placeholder={inputPlaceholder ?? 'Enter your response'}
+                      inputMode={inputMode}
+                      maxLength={inputMaxLength}
+                      className="flex-1 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs text-finova-text outline-none transition focus:border-finova-accent focus:ring-2 focus:ring-finova-accent/20"
+                      disabled={isSending || isInputLocked}
+                    />
+                    <button
+                      type="submit"
+                      disabled={isSending || isInputLocked || input.trim().length === 0}
+                      className="rounded-full bg-[#4285F4] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-white shadow-sm transition hover:bg-finova-primary/90 disabled:cursor-not-allowed disabled:bg-slate-300"
+                    >
+                      {isSending ? 'Sending' : 'Send'}
+                    </button>
+                  </div>
+                  {inputHelperText && (
+                    <p className="text-[11px] text-finova-muted">{inputHelperText}</p>
+                  )}
+                </form>
+              )}
+              {message.embedUrl && (
+                <div className="mt-3 overflow-hidden rounded-xl border border-slate-200">
+                  <iframe
+                    title="Secure application"
+                    src={message.embedUrl}
+                    className="h-72 w-full bg-white"
+                  />
+                </div>
+              )}
               {message.isLoading && (
                 <span className="mt-2 inline-flex items-center gap-2 text-xs text-finova-muted">
                   <span className="h-3 w-3 animate-spin rounded-full border-2 border-finova-primary border-t-transparent" />
@@ -131,37 +170,40 @@ function ChatPanel({
               )}
             </div>
           </div>
-        ))}
+          )
+        })}
         <div ref={endRef} />
       </div>
 
-      <form
-        className="border-t border-slate-200 bg-white px-4 py-3"
-        onSubmit={onSend}
-      >
-        <div className="flex items-center gap-2">
-          <input
-            type={inputType ?? 'text'}
-            value={input}
-            onChange={onInputChange}
-            placeholder={inputPlaceholder ?? 'Type your message...'}
-            inputMode={inputMode}
-            maxLength={inputMaxLength}
-            className="flex-1 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-finova-text outline-none transition focus:border-finova-accent focus:ring-2 focus:ring-finova-accent/20"
-            disabled={isSending || isInputLocked}
-          />
-          <button
-            type="submit"
-            disabled={isSending || isInputLocked || input.trim().length === 0}
-            className="rounded-full bg-[#4285F4] px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white shadow-sm transition hover:bg-finova-primary/90 disabled:cursor-not-allowed disabled:bg-slate-300"
-          >
-            {isSending ? 'Sending' : 'Send'}
-          </button>
-        </div>
-        {inputHelperText && (
-          <p className="mt-2 text-xs text-finova-muted">{inputHelperText}</p>
-        )}
-      </form>
+      {!isMcpActive && (
+        <form
+          className="border-t border-slate-200 bg-white px-4 py-3"
+          onSubmit={onSend}
+        >
+          <div className="flex items-center gap-2">
+            <input
+              type={inputType ?? 'text'}
+              value={input}
+              onChange={onInputChange}
+              placeholder={inputPlaceholder ?? 'Type your message...'}
+              inputMode={inputMode}
+              maxLength={inputMaxLength}
+              className="flex-1 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-finova-text outline-none transition focus:border-finova-accent focus:ring-2 focus:ring-finova-accent/20"
+              disabled={isSending || isInputLocked}
+            />
+            <button
+              type="submit"
+              disabled={isSending || isInputLocked || input.trim().length === 0}
+              className="rounded-full bg-[#4285F4] px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white shadow-sm transition hover:bg-finova-primary/90 disabled:cursor-not-allowed disabled:bg-slate-300"
+            >
+              {isSending ? 'Sending' : 'Send'}
+            </button>
+          </div>
+          {inputHelperText && (
+            <p className="mt-2 text-xs text-finova-muted">{inputHelperText}</p>
+          )}
+        </form>
+      )}
     </aside>
   )
 }
@@ -179,6 +221,7 @@ function Home({ onSignIn }) {
   const [activeInputRequest, setActiveInputRequest] = useState(null)
   const [isEligibilityLoading, setIsEligibilityLoading] = useState(false)
   const [offerIndex, setOfferIndex] = useState(0)
+  const lastPrefillFieldId = useRef(null)
   const canSubmit = useMemo(() => {
     return username.trim().length > 0 && password.trim().length > 0
   }, [username, password])
@@ -192,6 +235,17 @@ function Home({ onSignIn }) {
 
     return () => clearInterval(intervalId)
   }, [])
+
+  useEffect(() => {
+    if (!activeInputRequest?.fieldId) return
+    if (lastPrefillFieldId.current === activeInputRequest.fieldId) return
+    lastPrefillFieldId.current = activeInputRequest.fieldId
+    if (activeInputRequest.prefillValue !== undefined) {
+      setChatInput(String(activeInputRequest.prefillValue))
+    } else {
+      setChatInput('')
+    }
+  }, [activeInputRequest])
 
   const handleSubmit = async (event) => {
     event.preventDefault()
@@ -227,12 +281,22 @@ function Home({ onSignIn }) {
 
     setIsSendingChat(true)
     try {
+      const mcpInput = activeInputRequest?.sessionId
+        ? {
+            sessionId: activeInputRequest.sessionId,
+            fieldId: activeInputRequest.fieldId,
+          }
+        : null
       const response = await fetch('http://localhost:3001/api/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ message: trimmed, actionIntent }),
+        body: JSON.stringify({
+          message: trimmed,
+          actionIntent,
+          inputRequest: mcpInput,
+        }),
       })
 
       const payload = await response.json()
@@ -243,6 +307,7 @@ function Home({ onSignIn }) {
           payload.reply ||
           'Sorry, I could not get a response from the assistant.',
         isLoading: Boolean(payload.loading),
+        isMcpPrompt: Boolean(payload.inputRequest?.sessionId),
         button: payload.button
           ? {
               ...payload.button,
@@ -250,6 +315,7 @@ function Home({ onSignIn }) {
             }
           : null,
         buttons: payload.buttons ?? null,
+        embedUrl: payload.embedUrl ?? null,
       }
       setMessages((prev) => [...prev, botMessage])
       setActiveInputRequest(payload.inputRequest ?? null)
@@ -259,12 +325,19 @@ function Home({ onSignIn }) {
         setActiveInputRequest(null)
         const duration = Number(payload.loading.durationMs) || 5000
         window.setTimeout(() => {
+          const approvalText =
+            payload.loading.approvalMessage ?? 'Application result ready.'
+          const completionText = payload.loading.completionMessage
+          const followupText = completionText
+            ? `${approvalText}\n\n${completionText}`
+            : approvalText
           setMessages((prev) => [
             ...prev,
             {
               id: `bot-${Date.now() + 2}`,
               role: 'bot',
-              text: payload.loading.approvalMessage,
+              text: followupText,
+              button: payload.loading.completionButton ?? null,
             },
           ])
           setIsEligibilityLoading(false)
@@ -298,8 +371,10 @@ function Home({ onSignIn }) {
     const nextValue = event.target.value
     if (activeInputRequest?.inputMode === 'numeric') {
       const digitsOnly = nextValue.replace(/\D/g, '')
-      const maxLength = activeInputRequest?.maxLength ?? 4
-      setChatInput(digitsOnly.slice(0, maxLength))
+      const maxLength = activeInputRequest?.maxLength
+      setChatInput(
+        Number.isFinite(maxLength) ? digitsOnly.slice(0, maxLength) : digitsOnly
+      )
       return
     }
     setChatInput(nextValue)
@@ -307,7 +382,19 @@ function Home({ onSignIn }) {
 
   const handleActionButton = async (button) => {
     if (button.url) {
-      window.open(button.url, '_blank', 'noopener,noreferrer')
+      if (button.embedInChat) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `bot-${Date.now() + 1}`,
+            role: 'bot',
+            text: '',
+            embedUrl: button.url,
+          },
+        ])
+      } else {
+        window.open(button.url, '_blank', 'noopener,noreferrer')
+      }
       setMessages((prev) => [
         ...prev,
         {
@@ -562,9 +649,19 @@ function Home({ onSignIn }) {
         onClose={() => setIsChatOpen(false)}
         isSending={isSendingChat}
         isInputLocked={isEligibilityLoading}
+        isMcpActive={Boolean(activeInputRequest?.sessionId)}
         inputPlaceholder={activeInputRequest?.placeholder}
-        inputHelperText={activeInputRequest?.helperText}
-        inputType={activeInputRequest?.mask ? 'password' : 'text'}
+        inputHelperText={
+          activeInputRequest?.helperText ||
+          (activeInputRequest?.stepNumber && activeInputRequest?.totalSteps
+            ? `Step ${activeInputRequest.stepNumber} of ${activeInputRequest.totalSteps}`
+            : null)
+        }
+        inputType={
+          activeInputRequest?.mask
+            ? 'password'
+            : activeInputRequest?.inputType ?? 'text'
+        }
         inputMode={activeInputRequest?.inputMode}
         inputMaxLength={activeInputRequest?.maxLength}
         hasActionButton={messages.some(
