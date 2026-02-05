@@ -72,6 +72,169 @@ const initialMessages = [
   },
 ]
 
+const usStates = [
+  'AL',
+  'AK',
+  'AZ',
+  'AR',
+  'CA',
+  'CO',
+  'CT',
+  'DE',
+  'FL',
+  'GA',
+  'HI',
+  'ID',
+  'IL',
+  'IN',
+  'IA',
+  'KS',
+  'KY',
+  'LA',
+  'ME',
+  'MD',
+  'MA',
+  'MI',
+  'MN',
+  'MS',
+  'MO',
+  'MT',
+  'NE',
+  'NV',
+  'NH',
+  'NJ',
+  'NM',
+  'NY',
+  'NC',
+  'ND',
+  'OH',
+  'OK',
+  'OR',
+  'PA',
+  'RI',
+  'SC',
+  'SD',
+  'TN',
+  'TX',
+  'UT',
+  'VT',
+  'VA',
+  'WA',
+  'WV',
+  'WI',
+  'WY',
+]
+
+const loanMockSteps = [
+  {
+    id: 'name',
+    title: 'Name',
+    fields: [
+      { name: 'firstName', label: 'First Name', type: 'text' },
+      { name: 'lastName', label: 'Last Name', type: 'text' },
+    ],
+  },
+  {
+    id: 'dob',
+    title: 'Date of Birth',
+    fields: [{ name: 'dateOfBirth', label: 'Date of Birth', type: 'date' }],
+  },
+  {
+    id: 'ssn',
+    title: 'Social Security Number',
+    fields: [{ name: 'ssn', label: 'Social Security Number', type: 'ssn' }],
+  },
+  {
+    id: 'address',
+    title: 'Address',
+    fields: [
+      { name: 'addressLine1', label: 'Address Line 1', type: 'text' },
+      { name: 'addressLine2', label: 'Address Line 2', type: 'text', optional: true },
+      { name: 'city', label: 'City', type: 'text' },
+      { name: 'state', label: 'State', type: 'select' },
+      { name: 'zip', label: 'ZIP Code', type: 'zip' },
+    ],
+  },
+  {
+    id: 'employment',
+    title: 'Employment Status',
+    fields: [{ name: 'employmentStatus', label: 'Employment Status', type: 'radio' }],
+  },
+  {
+    id: 'income',
+    title: 'Annual Income',
+    fields: [{ name: 'annualIncome', label: 'Annual Income', type: 'currency' }],
+  },
+]
+
+const mockLoanPrefill = {
+  firstName: 'Greg',
+  lastName: 'Wilwerding',
+  addressLine1: '123 Market Street',
+  addressLine2: 'Suite 500',
+  city: 'San Francisco',
+  state: 'CA',
+  zip: '94105',
+}
+
+const currencyFormatter = new Intl.NumberFormat('en-US', {
+  maximumFractionDigits: 0,
+})
+
+const formatCurrencyValue = (value) => {
+  if (value === null || value === undefined || value === '') return ''
+  const numericValue = Number(value)
+  if (Number.isNaN(numericValue)) return ''
+  return `$${currencyFormatter.format(numericValue)}`
+}
+
+const formatSsnValue = (value) => {
+  const digits = String(value ?? '').replace(/\D/g, '').slice(0, 9)
+  if (digits.length <= 3) return digits
+  if (digits.length <= 5) return `${digits.slice(0, 3)}-${digits.slice(3)}`
+  return `${digits.slice(0, 3)}-${digits.slice(3, 5)}-${digits.slice(5)}`
+}
+
+const getMockLoanStepPrompt = (stepId) => {
+  switch (stepId) {
+    case 'name':
+      return 'Let’s start with your name.'
+    case 'dob':
+      return 'What is your date of birth?'
+    case 'ssn':
+      return 'Please share your Social Security number.'
+    case 'address':
+      return 'What is your current address?'
+    case 'employment':
+      return 'What is your employment status?'
+    case 'income':
+      return 'What is your annual income?'
+    default:
+      return 'Please provide the next details.'
+  }
+}
+
+const formatMockLoanFieldValue = (field, rawValue) => {
+  if (rawValue === null || rawValue === undefined || rawValue === '') {
+    return field.optional ? 'Not provided' : ''
+  }
+  if (field.type === 'ssn') {
+    return formatSsnValue(rawValue)
+  }
+  if (field.type === 'currency') {
+    return formatCurrencyValue(rawValue)
+  }
+  return String(rawValue)
+}
+
+const formatMockLoanSubmission = (stepConfig, data) => {
+  if (!stepConfig) return ''
+  const lines = stepConfig.fields
+    .map((field) => formatMockLoanFieldValue(field, data?.[field.name]))
+    .filter(Boolean)
+  return lines.join('\n')
+}
+
 function ChatPanel({
   isOpen,
   messages,
@@ -89,6 +252,12 @@ function ChatPanel({
   inputMaxLength,
   isInputLocked,
   isMcpActive,
+  isMockLoanActive,
+  mockLoanStepIndex,
+  mockLoanData,
+  onMockLoanChange,
+  onMockLoanSubmit,
+  isMockLoanLoading,
 }) {
   const endRef = useRef(null)
 
@@ -125,6 +294,12 @@ function ChatPanel({
         {messages.map((message, index) => {
           const isActivePrompt =
             message.isMcpPrompt && index === messages.length - 1
+          const isActiveMockStep =
+            message.mockLoanStep != null && index === messages.length - 1
+          const stepConfig =
+            isActiveMockStep && mockLoanStepIndex != null
+              ? loanMockSteps[mockLoanStepIndex]
+              : null
           return (
           <div
             key={message.id}
@@ -140,6 +315,126 @@ function ChatPanel({
               }`}
             >
               {message.text}
+              {isActiveMockStep && stepConfig && (
+                <form className="mt-3 space-y-3" onSubmit={onMockLoanSubmit}>
+                  {stepConfig.fields.map((field) => {
+                    if (field.type === 'radio') {
+                      return (
+                        <div key={field.name} className="space-y-2 text-xs">
+                          <p className="font-semibold text-finova-text">
+                            {field.label}
+                          </p>
+                          {['Employed', 'Self-Employed', 'Unemployed', 'Retired'].map(
+                            (option) => (
+                              <label
+                                key={option}
+                                className="flex items-center gap-2 text-finova-text"
+                              >
+                                <input
+                                  type="radio"
+                                  name={field.name}
+                                  value={option}
+                                  checked={mockLoanData?.[field.name] === option}
+                                  onChange={(event) =>
+                                    onMockLoanChange(
+                                      field.name,
+                                      event.target.value,
+                                      field.type
+                                    )
+                                  }
+                                />
+                                {option}
+                              </label>
+                            )
+                          )}
+                        </div>
+                      )
+                    }
+
+                    if (field.type === 'select') {
+                      return (
+                        <label key={field.name} className="space-y-1 text-xs">
+                          <span className="font-semibold text-finova-text">
+                            {field.label}
+                          </span>
+                          <select
+                            value={mockLoanData?.[field.name] ?? ''}
+                            onChange={(event) =>
+                              onMockLoanChange(
+                                field.name,
+                                event.target.value,
+                                field.type
+                              )
+                            }
+                            className="w-full rounded-[8px] border border-slate-200 bg-white px-3 py-2 text-xs text-finova-text"
+                          >
+                            <option value="">Select</option>
+                            {usStates.map((state) => (
+                              <option key={state} value={state}>
+                                {state}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )
+                    }
+
+                    const value = mockLoanData?.[field.name] ?? ''
+                    const displayValue =
+                      field.type === 'ssn'
+                        ? formatSsnValue(value)
+                        : field.type === 'currency'
+                          ? formatCurrencyValue(value)
+                          : value
+                    const inputType = field.type === 'date' ? 'date' : 'text'
+                    const inputMode =
+                      field.type === 'ssn' ||
+                      field.type === 'zip' ||
+                      field.type === 'currency'
+                        ? 'numeric'
+                        : undefined
+                    const placeholder = field.optional
+                      ? 'Optional'
+                      : field.type === 'ssn'
+                        ? '###-##-####'
+                        : field.type === 'zip'
+                          ? '#####'
+                          : field.type === 'currency'
+                            ? '$0'
+                            : ''
+                    return (
+                      <label key={field.name} className="space-y-1 text-xs">
+                        <span className="font-semibold text-finova-text">
+                          {field.label}
+                        </span>
+                        <input
+                          type={inputType}
+                          value={displayValue}
+                          onChange={(event) =>
+                            onMockLoanChange(
+                              field.name,
+                              event.target.value,
+                              field.type
+                            )
+                          }
+                          inputMode={inputMode}
+                          placeholder={placeholder}
+                          className="w-full rounded-[8px] border border-slate-200 bg-white px-3 py-2 text-xs text-finova-text"
+                        />
+                      </label>
+                    )
+                  })}
+                  <button
+                    type="submit"
+                    disabled={isMockLoanLoading}
+                    className="mt-2 w-full rounded-full bg-[#4285F4] px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white shadow-sm transition hover:bg-finova-primary/90 disabled:cursor-not-allowed disabled:bg-slate-300"
+                  >
+                    {mockLoanStepIndex === loanMockSteps.length - 1
+                      ? 'Submit'
+                      : 'Next'}
+                  </button>
+                </form>
+              )}
               {isActivePrompt && (
                 <form className="mt-3 space-y-2" onSubmit={onSend}>
                   <div className="flex items-center gap-2">
@@ -204,7 +499,11 @@ function ChatPanel({
                     event.preventDefault()
                     onActionButton?.(message.button)
                   }}
-                  className="mt-3 inline-flex w-full items-center justify-center rounded-full bg-[#4285F4] px-3 py-2 text-xs font-semibold uppercase tracking-wide text-white shadow-sm transition hover:bg-finova-primary/90"
+                  className={`mt-3 inline-flex w-full items-center justify-center rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-wide shadow-sm transition ${
+                    message.button.variant === 'secondary'
+                      ? 'border border-[#4285F4] bg-white text-[#4285F4] hover:bg-finova-accent'
+                      : 'bg-[#4285F4] text-white hover:bg-finova-primary/90'
+                  }`}
                 >
                   {message.button.label}
                 </a>
@@ -216,7 +515,7 @@ function ChatPanel({
         <div ref={endRef} />
       </div>
 
-      {!isMcpActive && (
+      {!isMcpActive && !isMockLoanActive && (
         <form
           className="border-t border-slate-200 bg-white px-4 py-3"
           onSubmit={onSend}
@@ -256,6 +555,11 @@ function Dashboard({ onNavigateHome }) {
   const [isSendingChat, setIsSendingChat] = useState(false)
   const [activeInputRequest, setActiveInputRequest] = useState(null)
   const [isEligibilityLoading, setIsEligibilityLoading] = useState(false)
+  const [isMockLoanActive, setIsMockLoanActive] = useState(false)
+  const [mockLoanStepIndex, setMockLoanStepIndex] = useState(null)
+  const [mockLoanData, setMockLoanData] = useState(mockLoanPrefill)
+  const [isMockLoanLoading, setIsMockLoanLoading] = useState(false)
+  const [mockLoanActionUrl, setMockLoanActionUrl] = useState(null)
   const lastPrefillFieldId = useRef(null)
   const nextDueDate = formatShortDate(getNextFifteenth())
   const checkingLastActivity = formatShortDate(getDateDaysAgo(1))
@@ -324,6 +628,7 @@ function Dashboard({ onNavigateHome }) {
       })
 
       const payload = await response.json()
+      const isMockLoanStart = Boolean(payload.mockLoanFlow?.start)
       const botMessage = {
         id: `bot-${Date.now() + 1}`,
         role: 'bot',
@@ -332,6 +637,7 @@ function Dashboard({ onNavigateHome }) {
           'Sorry, I could not get a response from the assistant.',
         isLoading: Boolean(payload.loading),
         isMcpPrompt: Boolean(payload.inputRequest?.sessionId),
+        mockLoanStep: isMockLoanStart ? 0 : null,
         button: payload.button
           ? {
               ...payload.button,
@@ -343,6 +649,14 @@ function Dashboard({ onNavigateHome }) {
       }
       setMessages((prev) => [...prev, botMessage])
       setActiveInputRequest(payload.inputRequest ?? null)
+
+      if (isMockLoanStart) {
+        setIsMockLoanActive(true)
+        setMockLoanStepIndex(0)
+        setMockLoanData(mockLoanPrefill)
+        setIsMockLoanLoading(false)
+        setMockLoanActionUrl(payload.mockLoanFlow?.actionUrl ?? null)
+      }
 
       if (payload.loading) {
         setIsEligibilityLoading(true)
@@ -402,6 +716,91 @@ function Dashboard({ onNavigateHome }) {
       return
     }
     setChatInput(nextValue)
+  }
+
+  const handleMockLoanChange = (name, value, type) => {
+    let nextValue = value
+    if (type === 'ssn') {
+      nextValue = value.replace(/\D/g, '').slice(0, 9)
+    } else if (type === 'zip') {
+      nextValue = value.replace(/\D/g, '').slice(0, 5)
+    } else if (type === 'currency') {
+      nextValue = value.replace(/\D/g, '').slice(0, 9)
+    }
+    setMockLoanData((prev) => ({ ...prev, [name]: nextValue }))
+  }
+
+  const handleMockLoanSubmit = (event) => {
+    event.preventDefault()
+    if (isMockLoanLoading || mockLoanStepIndex == null) return
+
+    const currentStep = loanMockSteps[mockLoanStepIndex]
+    const submissionText = formatMockLoanSubmission(currentStep, mockLoanData)
+    if (submissionText) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          text: submissionText,
+        },
+      ])
+    }
+
+    if (mockLoanStepIndex < loanMockSteps.length - 1) {
+      const nextIndex = mockLoanStepIndex + 1
+      const nextStep = loanMockSteps[nextIndex]
+      setMockLoanStepIndex(nextIndex)
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `bot-${Date.now() + 1}`,
+          role: 'bot',
+          text: getMockLoanStepPrompt(nextStep.id),
+          mockLoanStep: nextIndex,
+        },
+      ])
+      return
+    }
+
+    setIsMockLoanLoading(true)
+    const loadingId = `bot-${Date.now() + 1}`
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: loadingId,
+        role: 'bot',
+        text: 'Checking eligibility with our underwriting platform…',
+        isLoading: true,
+      },
+    ])
+
+    window.setTimeout(() => {
+      setMessages((prev) => {
+        const nextMessages = prev.map((message) =>
+          message.id === loadingId ? { ...message, isLoading: false } : message
+        )
+        return [
+          ...nextMessages,
+          {
+            id: `bot-${Date.now() + 2}`,
+            role: 'bot',
+            text:
+              "You’ve been approved for a personal loan up to $25,000. Please click the link below to set your loan amount, see your interest rates, prove your identity, and sign loan documents in our Secure Loan Center.",
+            button: mockLoanActionUrl
+              ? {
+                  label: 'Complete Loan Application',
+                  url: mockLoanActionUrl,
+                  openInNewWindow: true,
+                }
+              : null,
+          },
+        ]
+      })
+      setIsMockLoanLoading(false)
+      setIsMockLoanActive(false)
+      setMockLoanStepIndex(null)
+    }, 5000)
   }
 
   const handleActionButton = async (button) => {
@@ -610,8 +1009,14 @@ function Dashboard({ onNavigateHome }) {
         onSend={handleSendMessage}
         onClose={() => setIsChatOpen(false)}
         isSending={isSendingChat}
-        isInputLocked={isEligibilityLoading}
+        isInputLocked={isEligibilityLoading || isMockLoanLoading}
         isMcpActive={Boolean(activeInputRequest?.sessionId)}
+        isMockLoanActive={isMockLoanActive}
+        mockLoanStepIndex={mockLoanStepIndex}
+        mockLoanData={mockLoanData}
+        onMockLoanChange={handleMockLoanChange}
+        onMockLoanSubmit={handleMockLoanSubmit}
+        isMockLoanLoading={isMockLoanLoading}
         inputPlaceholder={activeInputRequest?.placeholder}
         inputHelperText={
           activeInputRequest?.helperText ||
