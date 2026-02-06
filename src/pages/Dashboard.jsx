@@ -156,6 +156,16 @@ const loanMockSteps = [
     ],
   },
   {
+    id: 'phone',
+    title: 'Phone Number',
+    fields: [{ name: 'phone', label: 'Phone Number', type: 'phone' }],
+  },
+  {
+    id: 'email',
+    title: 'Email Address',
+    fields: [{ name: 'email', label: 'Email Address', type: 'email' }],
+  },
+  {
     id: 'employment',
     title: 'Employment Status',
     fields: [{ name: 'employmentStatus', label: 'Employment Status', type: 'radio' }],
@@ -168,8 +178,10 @@ const loanMockSteps = [
 ]
 
 const mockLoanPrefill = {
-  firstName: 'Greg',
-  lastName: 'Wilwerding',
+  firstName: 'Ori',
+  lastName: 'Faran',
+  phone: '(415) 555-8888',
+  email: 'ori@callvu.com',
   addressLine1: '123 Market Street',
   addressLine2: 'Suite 500',
   city: 'San Francisco',
@@ -205,6 +217,10 @@ const getMockLoanStepPrompt = (stepId) => {
       return 'Please share your Social Security number.'
     case 'address':
       return 'What is your current address?'
+    case 'phone':
+      return 'What is the best phone number to reach you?'
+    case 'email':
+      return 'What is the best email address to reach you?'
     case 'employment':
       return 'What is your employment status?'
     case 'income':
@@ -229,6 +245,43 @@ const formatMockLoanFieldValue = (field, rawValue) => {
 
 const formatMockLoanSubmission = (stepConfig, data) => {
   if (!stepConfig) return ''
+  if (stepConfig.id === 'address') {
+    const line1 = formatMockLoanFieldValue(
+      stepConfig.fields.find((field) => field.name === 'addressLine1'),
+      data?.addressLine1
+    )
+    const line2 = formatMockLoanFieldValue(
+      stepConfig.fields.find((field) => field.name === 'addressLine2'),
+      data?.addressLine2
+    )
+    const city = formatMockLoanFieldValue(
+      stepConfig.fields.find((field) => field.name === 'city'),
+      data?.city
+    )
+    const zip = formatMockLoanFieldValue(
+      stepConfig.fields.find((field) => field.name === 'zip'),
+      data?.zip
+    )
+    const lines = []
+    if (line1) lines.push(line1)
+    if (line2) lines.push(line2)
+    if (city || zip) {
+      lines.push([city, zip].filter(Boolean).join(', '))
+    }
+    return lines.join('\n')
+  }
+  if (stepConfig.id === 'employment') {
+    return formatMockLoanFieldValue(
+      stepConfig.fields.find((field) => field.name === 'employmentStatus'),
+      data?.employmentStatus
+    )
+  }
+  if (stepConfig.id === 'income') {
+    return formatMockLoanFieldValue(
+      stepConfig.fields.find((field) => field.name === 'annualIncome'),
+      data?.annualIncome
+    )
+  }
   const lines = stepConfig.fields
     .map((field) => formatMockLoanFieldValue(field, data?.[field.name]))
     .filter(Boolean)
@@ -390,7 +443,8 @@ function ChatPanel({
                     const inputMode =
                       field.type === 'ssn' ||
                       field.type === 'zip' ||
-                      field.type === 'currency'
+                      field.type === 'currency' ||
+                      field.type === 'phone'
                         ? 'numeric'
                         : undefined
                     const placeholder = field.optional
@@ -726,6 +780,8 @@ function Dashboard({ onNavigateHome }) {
       nextValue = value.replace(/\D/g, '').slice(0, 5)
     } else if (type === 'currency') {
       nextValue = value.replace(/\D/g, '').slice(0, 9)
+    } else if (type === 'phone') {
+      nextValue = value.replace(/\D/g, '').slice(0, 10)
     }
     setMockLoanData((prev) => ({ ...prev, [name]: nextValue }))
   }
@@ -873,7 +929,7 @@ function Dashboard({ onNavigateHome }) {
       <main className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-10">
         <section className="rounded-2xl border border-slate-200 bg-finova-white p-6 shadow-sm transition hover:shadow-md">
           <h2 className="text-2xl font-semibold text-finova-primary">
-            Welcome back, Greg!
+            Welcome back, Ori!
           </h2>
           <p className="mt-2 text-sm text-finova-muted">
             Here’s your financial snapshot.
